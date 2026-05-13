@@ -1,0 +1,15 @@
+bench/data/
+bench/experiments/
+bench/results/
+benches/
+benchmarks/results/
+.claude/
+.idea/
+debug/
+target/
+
+**/*.rs.bk
+
+*.iml
+.DS_Store
+.worktrees/
