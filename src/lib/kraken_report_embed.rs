@@ -219,6 +219,8 @@ mod tests {
             taxon_id,
             name: name.to_owned(),
             indent,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         }
     }
 

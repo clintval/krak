@@ -36,25 +36,37 @@ pub struct KrakenReportEntry {
     /// Leading space count in the name column; encodes tree depth
     /// ([`SPACES_PER_DEPTH`] spaces per level).
     pub indent: usize,
+    /// Total minimizer count for this clade (from kraken2's
+    /// `--report-minimizer-data` 8-column output). `None` for standard
+    /// 6-column reports.
+    #[serde(default)]
+    pub minimizer_count: Option<u64>,
+    /// Distinct minimizer count for this clade (from kraken2's
+    /// `--report-minimizer-data` 8-column output). `None` for standard
+    /// 6-column reports.
+    #[serde(default)]
+    pub distinct_minimizer_count: Option<u64>,
 }
 
 impl KrakenReportEntry {
     /// Parse a single tab-delimited line from a Kraken report file.
+    ///
+    /// Accepts either kraken2's standard 6-column format
+    /// `(pct, clade, direct, rank, taxon_id, name)` or the extended 8-column
+    /// `--report-minimizer-data` format, which inserts
+    /// `minimizer_count` and `distinct_minimizer_count` between `direct`
+    /// and `rank`: `(pct, clade, direct, mc, dmc, rank, taxon_id, name)`.
     pub fn from_line(line: &str) -> Result<Self> {
         let fields: Vec<&str> = line.split('\t').collect();
-        if fields.len() < 6 {
-            bail!(
-                "expected at least 6 tab-delimited fields, found {}: {:?}",
-                fields.len(),
+        let has_minimizers = match fields.len() {
+            6 => false,
+            8 => true,
+            n => bail!(
+                "expected 6 or 8 tab-delimited fields, found {}: {:?}",
+                n,
                 line
-            );
-        }
-        if fields.len() > 6 {
-            log::debug!(
-                "ignoring {} trailing tab-delimited field(s) in Kraken report line",
-                fields.len() - 6
-            );
-        }
+            ),
+        };
 
         let pct_fragments = fields[0]
             .trim()
@@ -68,14 +80,28 @@ impl KrakenReportEntry {
             .trim()
             .parse::<u64>()
             .with_context(|| format!("failed to parse num_fragments_direct: {:?}", fields[2]))?;
-        let rank_code = fields[3].trim().to_owned();
-        let taxon_id = fields[4]
+
+        let (minimizer_count, distinct_minimizer_count, rank_idx) = if has_minimizers {
+            let mc = fields[3]
+                .trim()
+                .parse::<u64>()
+                .with_context(|| format!("failed to parse minimizer_count: {:?}", fields[3]))?;
+            let dmc = fields[4].trim().parse::<u64>().with_context(|| {
+                format!("failed to parse distinct_minimizer_count: {:?}", fields[4])
+            })?;
+            (Some(mc), Some(dmc), 5)
+        } else {
+            (None, None, 3)
+        };
+
+        let rank_code = fields[rank_idx].trim().to_owned();
+        let taxon_id = fields[rank_idx + 1]
             .trim()
             .parse::<u32>()
-            .with_context(|| format!("failed to parse taxon_id: {:?}", fields[4]))?;
+            .with_context(|| format!("failed to parse taxon_id: {:?}", fields[rank_idx + 1]))?;
 
         // Indent is the number of leading ASCII spaces (Kraken uses spaces only).
-        let name_field = fields[5];
+        let name_field = fields[rank_idx + 2];
         let indent = name_field.bytes().take_while(|&b| b == b' ').count();
         if indent % SPACES_PER_DEPTH != 0 {
             bail!(
@@ -96,6 +122,8 @@ impl KrakenReportEntry {
             taxon_id,
             name,
             indent,
+            minimizer_count,
+            distinct_minimizer_count,
         })
     }
 
@@ -127,6 +155,28 @@ impl KrakenReportEntry {
         }
         Ok(entries)
     }
+}
+
+/// Walks each entry's parent chain and bails if any walk exceeds the total
+/// node count, which can only happen if there is a cycle.
+///
+/// Acyclicity is guaranteed by the indent-stack construction in
+/// [`KrakenTaxonomyTree::from_entries`], so this is a defensive check; it is
+/// exercised directly by unit tests.
+fn detect_cycle(parents: &AHashMap<u32, Option<u32>>) -> Result<()> {
+    let max_depth = parents.len();
+    for &start in parents.keys() {
+        let mut cur = parents.get(&start).copied().flatten();
+        let mut steps = 0usize;
+        while let Some(id) = cur {
+            steps += 1;
+            if steps > max_depth {
+                bail!("cycle detected in taxonomy tree while walking ancestors of taxon {start}");
+            }
+            cur = parents.get(&id).copied().flatten();
+        }
+    }
+    Ok(())
 }
 
 /// An in-memory NCBI taxonomy tree reconstructed from a Kraken report.
@@ -203,20 +253,7 @@ impl KrakenTaxonomyTree {
             last = entry;
         }
 
-        let max_depth = parents.len();
-        for &start in parents.keys() {
-            let mut cur = parents.get(&start).copied().flatten();
-            let mut steps = 0usize;
-            while let Some(id) = cur {
-                steps += 1;
-                if steps > max_depth {
-                    bail!(
-                        "cycle detected in taxonomy tree while walking ancestors of taxon {start}"
-                    );
-                }
-                cur = parents.get(&id).copied().flatten();
-            }
-        }
+        detect_cycle(&parents)?;
 
         Ok(KrakenTaxonomyTree { parents, children })
     }
@@ -304,6 +341,8 @@ mod tests {
             taxon_id,
             name: name.to_owned(),
             indent,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         }
     }
 
@@ -380,13 +419,52 @@ mod tests {
     }
 
     #[test]
-    fn test_from_line_accepts_trailing_extra_fields() {
-        // A line with more than 6 fields (e.g. --report-minimizer-data has 8)
-        // is parsed by taking the first 6 fields and emitting a debug log.
-        let line = "100.00\t1\t1\tR\t1\troot\textra1\textra2";
+    fn test_from_line_6col_has_no_minimizer_data() {
+        let line = "100.00\t1\t1\tR\t1\troot";
         let e = KrakenReportEntry::from_line(line).unwrap();
+        assert_eq!(e.minimizer_count, None);
+        assert_eq!(e.distinct_minimizer_count, None);
+        assert_eq!(e.rank_code, "R");
         assert_eq!(e.taxon_id, 1);
         assert_eq!(e.name, "root");
+    }
+
+    #[test]
+    fn test_from_line_8col_parses_minimizer_data() {
+        // kraken2 --report-minimizer-data inserts two columns BETWEEN
+        // direct_count (col 3) and rank_code (col 4): the new col layout is
+        // pct, clade, direct, mc, dmc, rank, taxon_id, name.
+        let line = "100.00\t2000\t0\t500\t123\tR\t1\troot";
+        let e = KrakenReportEntry::from_line(line).unwrap();
+        assert_eq!(e.minimizer_count, Some(500));
+        assert_eq!(e.distinct_minimizer_count, Some(123));
+        assert_eq!(e.rank_code, "R");
+        assert_eq!(e.taxon_id, 1);
+        assert_eq!(e.name, "root");
+    }
+
+    #[test]
+    fn test_from_line_8col_bad_minimizer_count_errors() {
+        let line = "100.00\t1\t1\tNOPE\t123\tR\t1\troot";
+        let err = KrakenReportEntry::from_line(line).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("minimizer_count"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_from_line_8col_bad_distinct_minimizer_count_errors() {
+        let line = "100.00\t1\t1\t500\tNOPE\tR\t1\troot";
+        let err = KrakenReportEntry::from_line(line).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("distinct_minimizer_count"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_from_line_7col_errors() {
+        let line = "100.00\t1\t1\tX\tR\t1\troot";
+        let err = KrakenReportEntry::from_line(line).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("6 or 8"), "got: {msg}");
     }
 
     #[test]
@@ -462,6 +540,53 @@ mod tests {
     }
 
     #[test]
+    fn test_read_file_reports_line_number_on_parse_error() {
+        // A malformed entry on line 2 must surface the line number in the
+        // error context produced by read_file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("bad.k2");
+        std::fs::write(&p, "100.00\t1\t1\tR\t1\troot\nGARBAGE_NOT_TAB_DELIMITED\n").unwrap();
+        let err = KrakenReportEntry::read_file(&p).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("line 2"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_detect_cycle_finds_two_node_cycle() {
+        // 1 -> 2 -> 1: each walk would loop forever without the step bound.
+        let mut parents: AHashMap<u32, Option<u32>> = AHashMap::new();
+        parents.insert(1, Some(2));
+        parents.insert(2, Some(1));
+        let err = detect_cycle(&parents).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("cycle detected"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_detect_cycle_passes_on_acyclic_chain() {
+        let mut parents: AHashMap<u32, Option<u32>> = AHashMap::new();
+        parents.insert(1, None);
+        parents.insert(2, Some(1));
+        parents.insert(3, Some(2));
+        assert!(detect_cycle(&parents).is_ok());
+    }
+
+    #[test]
+    fn test_tree_from_file_builds_tree() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let p = dir.path().join("r.k2");
+        std::fs::write(
+            &p,
+            "100.00\t2000\t0\tR\t1\troot\n 50.00\t1000\t100\tS\t9606\t  Homo sapiens\n",
+        )
+        .unwrap();
+        let tree = KrakenTaxonomyTree::from_file(&p).unwrap();
+        assert!(tree.contains(1));
+        assert!(tree.contains(9606));
+        assert_eq!(tree.parent_of(9606), Some(1));
+    }
+
+    #[test]
     fn test_read_file() {
         use std::io::Write;
         let mut tmp = tempfile::NamedTempFile::new().unwrap();
@@ -490,14 +615,15 @@ mod tests {
     }
 
     #[test]
-    fn test_from_line_accepts_extra_columns() {
-        // Eight tab-delimited fields: the original 6 plus two extras. C9
-        // says we should accept these and ignore trailing fields.
-        let line = "100.00\t2000\t0\tR\t1\t  root\textra1\textra2";
+    fn test_from_line_8col_preserves_indent() {
+        // 8-col layout: pct, clade, direct, mc, dmc, rank, taxon_id, name.
+        let line = "100.00\t2000\t0\t500\t123\tR\t1\t  root";
         let entry = KrakenReportEntry::from_line(line).unwrap();
         assert_eq!(entry.taxon_id, 1);
         assert_eq!(entry.name, "root");
         assert_eq!(entry.indent, 2);
+        assert_eq!(entry.minimizer_count, Some(500));
+        assert_eq!(entry.distinct_minimizer_count, Some(123));
     }
 
     #[test]
@@ -537,6 +663,8 @@ mod tests {
             taxon_id: 9606,
             name: "Homo sapiens".to_owned(),
             indent: 4,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let recovered: KrakenReportEntry = serde_json::from_str(&json).unwrap();

@@ -1741,10 +1741,21 @@ fn test_report2tsv_positional_input_and_output() {
     let mut lines = got.lines();
     assert_eq!(
         lines.next().unwrap(),
-        "pct_fragments\tnum_fragments_clade\tnum_fragments_direct\trank_code\ttaxon_id\tname"
+        "tax_id\tname\trank\tlevel\tparent_tax_id\tparent_rank\t\
+         clade_count\tdirect_count\tdescendant_count\t\
+         frac_clade\tfrac_direct\tfrac_descendant\t\
+         minimizer_count\tdistinct_minimizer_count"
     );
-    assert_eq!(lines.next().unwrap(), "100.00\t2000\t0\tR\t1\troot");
-    assert_eq!(lines.next().unwrap(), "100.00\t2000\t0\tD\t2\tBacteria");
+    // root: clade=2000, direct=0, descendant=2000, fractions all over 2000.
+    assert_eq!(
+        lines.next().unwrap(),
+        "1\troot\tR\t0\t\t\t2000\t0\t2000\t1\t0\t1\t\t"
+    );
+    // Bacteria: depth 1, parent root.
+    assert_eq!(
+        lines.next().unwrap(),
+        "2\tBacteria\tD\t1\t1\tR\t2000\t0\t2000\t1\t0\t1\t\t"
+    );
     assert!(lines.next().is_none());
 }
 
