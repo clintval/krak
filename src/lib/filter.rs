@@ -56,18 +56,29 @@ fn build_taxon_set(
 /// Arguments for the `filter` command.
 #[derive(Debug, Clone)]
 pub struct FilterArgs {
-    /// Input SAM/BAM/CRAM file annotated with `ti` tags.
+    /// Input SAM/BAM/CRAM file annotated with `ti` tags, or R1 FASTA/FASTQ when
+    /// paired with `input2`.
     pub input: std::path::PathBuf,
-    /// Output SAM/BAM/CRAM for passing records.
+    /// R2 FASTA/FASTQ for paired-end filtering. Only valid with FASTA/FASTQ
+    /// `input`; mutually exclusive with `per_record`.
+    pub input2: Option<std::path::PathBuf>,
+    /// Output SAM/BAM/CRAM for passing records, or R1 FASTA/FASTQ when paired
+    /// with `output2`.
     pub output: std::path::PathBuf,
+    /// R2 output FASTA/FASTQ for paired-end filtering; must be `Some` iff
+    /// `input2` is `Some`.
+    pub output2: Option<std::path::PathBuf>,
     /// Kraken report file; fallback when no report is embedded in the SAM/BAM/CRAM header.
     pub kraken_report: Option<std::path::PathBuf>,
     /// TSV metrics output file. If `None`, metrics are only logged.
     pub metrics: Option<std::path::PathBuf>,
     /// Target taxon IDs to keep.
     pub taxon_ids: AHashSet<u32>,
-    /// Optional output for rejected records.
+    /// Optional output for rejected records (R1 in paired mode).
     pub rejects: Option<std::path::PathBuf>,
+    /// Optional R2 output for rejected records. Must be `Some` iff `rejects`
+    /// is `Some` and `input2` is `Some`.
+    pub rejects2: Option<std::path::PathBuf>,
     /// Keep reads assigned to ancestors of target taxa.
     pub allow_ancestors: bool,
     /// Maximum edit distance from reference for off-taxa rescue.
@@ -222,6 +233,13 @@ pub fn run_filter(args: FilterArgs) -> Result<()> {
 /// path's extension is ambiguous (no `.fa`/`.fq`/`.sam`/`.bam`/`.cram` and
 /// peers), defer to the byte sniffer.
 fn run_filter_dispatch(args: &FilterArgs) -> Result<Vec<TaxaFilterMetric>> {
+    // Paired-end FASTA/FASTQ: input2 is set; both inputs must be FASTQ-formatted
+    // (FASTA paired is not currently supported), --classifications is required,
+    // and --per-record is mutually exclusive with paired mode.
+    if args.input2.is_some() {
+        return Ok(vec![filter_paired_fastq(args)?]);
+    }
+
     // Fast path: extension says FASTX.
     if matches!(crate::infer_format(&args.input), InferredFormat::Fastx(_)) {
         if args.classifications.is_none() {
@@ -779,6 +797,205 @@ fn filter_fastq_from_reader(
         rout.into_inner()
             .finalize()
             .context("failed to finalize reject FASTQ output")?;
+    }
+    let leftover = lookup.count_unconsumed();
+    if leftover > 0 {
+        warn!(
+            "{leftover} Kraken assignments remained after the input ran out; \
+             the --classifications file appears to extend past the FASTQ input."
+        );
+    }
+    metric.finalize();
+    Ok(metric)
+}
+
+/// Paired-end FASTQ filter. Reads R1 and R2 in lockstep, looks up each
+/// template's taxon id once via R1's name (R2 must match), and writes
+/// kept/rejected templates to the paired outputs together.
+fn filter_paired_fastq(args: &FilterArgs) -> Result<TaxaFilterMetric> {
+    use noodles::fastq;
+
+    let input2 = args.input2.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("internal: filter_paired_fastq called with input2 = None")
+    })?;
+    let output2 = args.output2.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("paired-end FASTQ filtering requires two output paths via -o/--output")
+    })?;
+    if args.per_record {
+        anyhow::bail!("--per-record cannot be combined with paired-end FASTQ input");
+    }
+    if !matches!(
+        crate::infer_format(&args.input),
+        InferredFormat::Fastx(FastxKind::Fastq)
+    ) || !matches!(
+        crate::infer_format(input2),
+        InferredFormat::Fastx(FastxKind::Fastq)
+    ) {
+        anyhow::bail!(
+            "paired-end input requires FASTQ files on both sides \
+             (got {} and {})",
+            args.input.display(),
+            input2.display()
+        );
+    }
+    let classifications_path = args
+        .classifications
+        .as_deref()
+        .ok_or_else(|| anyhow::anyhow!("paired FASTQ input requires --classifications (-c)"))?;
+    if args.rejects.is_some() != args.rejects2.is_some() {
+        anyhow::bail!("paired-end rejects require two paths (-r R1 R2); got one of two");
+    }
+
+    let tree: Option<KrakenTaxonomyTree> = args
+        .kraken_report
+        .as_deref()
+        .map(KrakenTaxonomyTree::from_file)
+        .transpose()?;
+    validate_tree_requirements(&tree, args)?;
+    let expanded = build_taxon_set(
+        &args.taxon_ids,
+        tree.as_ref(),
+        args.include_descendants,
+        args.include_unclassified,
+    )?;
+    let params = FilterParams {
+        taxon_ids: &expanded,
+        tree: tree.as_ref(),
+        allow_ancestors: args.allow_ancestors,
+        rescue_max_edit_distance: args.rescue_max_edit_distance,
+        rescue_max_indels: args.rescue_max_indels,
+        rescue_max_indel_length: args.rescue_max_indel_length,
+        rescue_n_adjustment: args.rescue_n_adjustment,
+        keep_unannotated: args.keep_unannotated,
+    };
+
+    let map = load_kraken_map_if_unordered(args, classifications_path)?;
+    let source = make_fastx_source(map.as_ref(), classifications_path);
+    let mut lookup = LookupState::from_source(source)?;
+
+    let r1_in = crate::open_fastx_reader(&args.input)
+        .with_context(|| format!("failed to open R1 FASTQ: {}", args.input.display()))?;
+    let r2_in = crate::open_fastx_reader(input2)
+        .with_context(|| format!("failed to open R2 FASTQ: {}", input2.display()))?;
+    let mut r1_reader = fastq::io::Reader::new(r1_in);
+    let mut r2_reader = fastq::io::Reader::new(r2_in);
+
+    let r1_sink = FastxSink::create(&args.output, args.threads, args.compression_level)
+        .with_context(|| {
+            format!(
+                "failed to create R1 output FASTQ: {}",
+                args.output.display()
+            )
+        })?;
+    let r2_sink = FastxSink::create(output2, args.threads, args.compression_level)
+        .with_context(|| format!("failed to create R2 output FASTQ: {}", output2.display()))?;
+    let mut r1_out = fastq::io::Writer::new(r1_sink);
+    let mut r2_out = fastq::io::Writer::new(r2_sink);
+
+    let mut reject_outs: Option<(fastq::io::Writer<FastxSink>, fastq::io::Writer<FastxSink>)> =
+        match (args.rejects.as_deref(), args.rejects2.as_deref()) {
+            (Some(p1), Some(p2)) => {
+                let s1 = FastxSink::create(p1, args.threads, args.compression_level).with_context(
+                    || format!("failed to create R1 rejects FASTQ: {}", p1.display()),
+                )?;
+                let s2 = FastxSink::create(p2, args.threads, args.compression_level).with_context(
+                    || format!("failed to create R2 rejects FASTQ: {}", p2.display()),
+                )?;
+                Some((fastq::io::Writer::new(s1), fastq::io::Writer::new(s2)))
+            }
+            _ => None,
+        };
+
+    let mut metric = TaxaFilterMetric {
+        missing_classifications: Some(0),
+        ..Default::default()
+    };
+
+    let mut pair_num = 0u64;
+    loop {
+        pair_num += 1;
+        let mut r1 = fastq::Record::default();
+        let mut r2 = fastq::Record::default();
+        let n1 = r1_reader.read_record(&mut r1)?;
+        let n2 = r2_reader.read_record(&mut r2)?;
+        match (n1, n2) {
+            (0, 0) => break,
+            (0, _) | (_, 0) => {
+                anyhow::bail!(
+                    "paired FASTQ: R1 and R2 have unequal record counts (at pair {pair_num})"
+                );
+            }
+            _ => {}
+        }
+        let r1_base = fastq_base_name(r1.name())?;
+        let r2_base = fastq_base_name(r2.name())?;
+        if r1_base != r2_base {
+            anyhow::bail!(
+                "paired FASTQ: R1 name {r1_base:?} does not match R2 name {r2_base:?} \
+                 (at pair {pair_num})"
+            );
+        }
+
+        metric.total += 2;
+        let taxon_id = match lookup.lookup(&r1_base)? {
+            Some(id) => id,
+            None => {
+                if let Some(ref mut v) = metric.missing_classifications {
+                    *v += 1;
+                }
+                0
+            }
+        };
+
+        match classify_fastx(taxon_id, &params) {
+            RecordDecision::OnTaxa => {
+                metric.on_taxa += 2;
+                r1_out
+                    .write_record(&r1)
+                    .context("failed to write R1 FASTQ")?;
+                r2_out
+                    .write_record(&r2)
+                    .context("failed to write R2 FASTQ")?;
+            }
+            RecordDecision::AncestorRescue => {
+                metric.rescued_ancestors += 2;
+                r1_out
+                    .write_record(&r1)
+                    .context("failed to write R1 FASTQ")?;
+                r2_out
+                    .write_record(&r2)
+                    .context("failed to write R2 FASTQ")?;
+            }
+            _ => {
+                if let Some((rout1, rout2)) = reject_outs.as_mut() {
+                    rout1
+                        .write_record(&r1)
+                        .context("failed to write R1 reject FASTQ")?;
+                    rout2
+                        .write_record(&r2)
+                        .context("failed to write R2 reject FASTQ")?;
+                }
+            }
+        }
+    }
+
+    r1_out
+        .into_inner()
+        .finalize()
+        .context("failed to finalize R1 FASTQ output")?;
+    r2_out
+        .into_inner()
+        .finalize()
+        .context("failed to finalize R2 FASTQ output")?;
+    if let Some((rout1, rout2)) = reject_outs {
+        rout1
+            .into_inner()
+            .finalize()
+            .context("failed to finalize R1 reject FASTQ output")?;
+        rout2
+            .into_inner()
+            .finalize()
+            .context("failed to finalize R2 reject FASTQ output")?;
     }
     let leftover = lookup.count_unconsumed();
     if leftover > 0 {
@@ -3747,11 +3964,14 @@ mod tests {
         fn default_for_test() -> Self {
             FilterArgs {
                 input: std::path::PathBuf::new(),
+                input2: None,
                 output: std::path::PathBuf::new(),
+                output2: None,
                 kraken_report: None,
                 metrics: None,
                 taxon_ids: AHashSet::new(),
                 rejects: None,
+                rejects2: None,
                 allow_ancestors: false,
                 rescue_max_edit_distance: None,
                 rescue_max_indels: None,
