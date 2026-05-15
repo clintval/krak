@@ -331,6 +331,17 @@ struct N2RefCmd {
     /// Replacement base quality score for converted N-calls (0–93). Defaults to original quality.
     #[arg(short = 'q', long)]
     qual: Option<u8>,
+
+    /// Number of bgzf compression worker threads for BAM output. At 1
+    /// (default), one compressor + one writer thread pipeline with the
+    /// n2ref loop. Ignored for SAM (no compression) and CRAM (per-block
+    /// codecs).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    threads: u16,
+
+    /// bgzf compression level (0-9) for BAM output. Ignored for SAM and CRAM.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=9))]
+    compression_level: u8,
 }
 
 /// Arguments for the `report2tsv` subcommand.
@@ -459,6 +470,8 @@ fn main() -> Result<(), Error> {
                 output,
                 reference: cmd.reference,
                 qual: cmd.qual,
+                threads: cmd.threads as usize,
+                compression_level: cmd.compression_level as u32,
             })
         }
         Commands::Report2Tsv(cmd) => {
