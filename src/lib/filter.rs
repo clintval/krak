@@ -103,6 +103,13 @@ pub struct FilterArgs {
     /// Kraken v1 output). Only applies to FASTA/FASTQ input; SAM/BAM/CRAM
     /// input reads taxon IDs from `ti` tags.
     pub unordered: bool,
+    /// Number of bgzf compression worker threads for `.gz` outputs.
+    /// At `1` (default), one compressor + one writer thread pipeline with the
+    /// main filter loop. Higher values fan compression out across more workers.
+    /// SAM and CRAM outputs ignore this value.
+    pub threads: usize,
+    /// bgzf compression level (0-9) for `.gz` outputs. Default 5.
+    pub compression_level: u32,
 }
 
 /// MD tag.
@@ -541,33 +548,33 @@ fn classify_fastx(taxon_id: u32, params: &FilterParams<'_>) -> RecordDecision {
     classify_by_taxon(taxon_id, params).unwrap_or(RecordDecision::Reject)
 }
 
-/// FASTX output sink that owns its `GzEncoder` so the gzip footer can be
-/// emitted explicitly via `try_finish` instead of relying on a `flush` against
-/// a `BufWriter<GzEncoder<...>>` chain (which only flushes the buffer, not the
-/// encoder). `crate::open_fastx_writer` returns `Box<dyn Write>` and consumes
-/// the encoder, so filter.rs builds the chain locally.
+/// FASTX output sink. For `.gz` outputs the file is encoded as BGZF
+/// (block-gzip) via `gzp::ParCompress` with the libdeflate backend; the
+/// resulting file is multi-member gzip and is read transparently by every
+/// standard gzip reader (`zcat`, `gunzip`, `flate2`, samtools, etc.). Plain
+/// outputs are buffered file writes with no compression.
 enum FastxSink {
     Plain(std::io::BufWriter<std::fs::File>),
-    Gz(Box<std::io::BufWriter<flate2::write::GzEncoder<std::fs::File>>>),
+    Bgzf(std::io::BufWriter<Box<dyn gzp::ZWriter<std::fs::File>>>),
 }
 
 impl std::io::Write for FastxSink {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         match self {
             Self::Plain(w) => w.write(buf),
-            Self::Gz(w) => w.write(buf),
+            Self::Bgzf(w) => w.write(buf),
         }
     }
     fn flush(&mut self) -> std::io::Result<()> {
         match self {
             Self::Plain(w) => w.flush(),
-            Self::Gz(w) => w.flush(),
+            Self::Bgzf(w) => w.flush(),
         }
     }
 }
 
 impl FastxSink {
-    fn create(path: &Path) -> std::io::Result<Self> {
+    fn create(path: &Path, threads: usize, compression_level: u32) -> std::io::Result<Self> {
         let is_gz = path
             .extension()
             .and_then(|e| e.to_str())
@@ -575,25 +582,44 @@ impl FastxSink {
             .unwrap_or(false);
         let file = std::fs::File::create(path)?;
         if is_gz {
-            let enc = flate2::write::GzEncoder::new(file, flate2::Compression::default());
-            Ok(Self::Gz(Box::new(std::io::BufWriter::new(enc))))
+            Ok(Self::Bgzf(std::io::BufWriter::new(build_bgzf_writer(
+                file,
+                threads,
+                compression_level,
+            )?)))
         } else {
             Ok(Self::Plain(std::io::BufWriter::new(file)))
         }
     }
 
-    /// Finalize the writer chain. For gzip outputs, this flushes the buffer
-    /// and then calls `try_finish` on the encoder to emit the gzip footer.
+    /// Finalize the writer chain. For BGZF outputs this flushes the BufWriter
+    /// and then calls `ZWriter::finish` so the BGZF EOF block is emitted.
     fn finalize(self) -> std::io::Result<()> {
         match self {
             Self::Plain(mut w) => w.flush(),
-            Self::Gz(w) => {
-                let mut enc = (*w).into_inner().map_err(|e| e.into_error())?;
-                enc.try_finish()?;
+            Self::Bgzf(w) => {
+                let mut zw = w.into_inner().map_err(|e| e.into_error())?;
+                zw.finish().map_err(std::io::Error::other)?;
                 Ok(())
             }
         }
     }
+}
+
+/// Build a libdeflate-backed BGZF writer with `threads` compression workers
+/// and the given level (0-9). At `threads = 1`, one compressor and one writer
+/// thread pipeline with the caller.
+fn build_bgzf_writer(
+    file: std::fs::File,
+    threads: usize,
+    level: u32,
+) -> std::io::Result<Box<dyn gzp::ZWriter<std::fs::File>>> {
+    let parz = gzp::par::compress::ParCompressBuilder::<gzp::deflate::Bgzf>::new()
+        .num_threads(threads.max(1))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+        .compression_level(gzp::Compression::new(level))
+        .from_writer(file);
+    Ok(Box::new(parz))
 }
 
 /// Strip the FASTQ description suffix (after first whitespace), then strip any
@@ -626,7 +652,7 @@ fn filter_fastq_from_reader(
 
     let mut reader = fastq::io::Reader::new(reader_in);
 
-    let out_sink = FastxSink::create(&args.output)
+    let out_sink = FastxSink::create(&args.output, args.threads, args.compression_level)
         .with_context(|| format!("failed to create output FASTQ: {}", args.output.display()))?;
     let mut out = fastq::io::Writer::new(out_sink);
 
@@ -634,7 +660,7 @@ fn filter_fastq_from_reader(
         .rejects
         .as_deref()
         .map(|p| {
-            FastxSink::create(p)
+            FastxSink::create(p, args.threads, args.compression_level)
                 .with_context(|| format!("failed to create rejects FASTQ: {}", p.display()))
                 .map(fastq::io::Writer::new)
         })
@@ -786,7 +812,7 @@ fn filter_fasta_from_reader(
     let mut lookup = LookupState::from_source(source)?;
     let mut reader = fasta::io::Reader::new(reader_in);
 
-    let out_sink = FastxSink::create(&args.output)
+    let out_sink = FastxSink::create(&args.output, args.threads, args.compression_level)
         .with_context(|| format!("failed to create output FASTA: {}", args.output.display()))?;
     let mut out = fasta::io::Writer::new(out_sink);
 
@@ -794,7 +820,7 @@ fn filter_fasta_from_reader(
         .rejects
         .as_deref()
         .map(|p| {
-            FastxSink::create(p)
+            FastxSink::create(p, args.threads, args.compression_level)
                 .with_context(|| format!("failed to create rejects FASTA: {}", p.display()))
                 .map(fasta::io::Writer::new)
         })
@@ -3347,6 +3373,108 @@ mod tests {
         assert_eq!(got, "@r1\nACGT\n+\nIIII\n");
     }
 
+    /// Write a `.fq.gz` input, kraken assignments file, and run `run_filter`
+    /// keeping taxon 9606 with the given `threads` + `compression_level`.
+    /// Returns the (compressed file size, decompressed content) for the output.
+    fn run_filter_fastq_gz(
+        tmpdir: &std::path::Path,
+        out_name: &str,
+        threads: usize,
+        compression_level: u32,
+        n_records: usize,
+    ) -> (u64, String) {
+        use flate2::write::GzEncoder;
+        use flate2::Compression;
+        use std::io::{Read as _, Write as _};
+
+        // Synthesize n_records FASTQ records with deterministic but varied
+        // payloads so compression has something to work on. Half assigned to
+        // 9606 (kept), half to 1234 (dropped) — exercises both branches.
+        let mut fastq = String::new();
+        let mut kraken = String::new();
+        for i in 0..n_records {
+            let name = format!("r{i}");
+            let bases: String = (0..96)
+                .map(|j| match (i + j) % 4 {
+                    0 => 'A',
+                    1 => 'C',
+                    2 => 'G',
+                    _ => 'T',
+                })
+                .collect();
+            let quals: String = "I".repeat(bases.len());
+            fastq.push_str(&format!("@{name}\n{bases}\n+\n{quals}\n"));
+            let taxon = if i % 2 == 0 { 9606 } else { 1234 };
+            kraken.push_str(&format!("C\t{name}\t{taxon}\t{}\t{taxon}:1\n", bases.len()));
+        }
+
+        let in_path = tmpdir.join("in.fq.gz");
+        {
+            let f = std::fs::File::create(&in_path).unwrap();
+            let mut enc = GzEncoder::new(f, Compression::default());
+            enc.write_all(fastq.as_bytes()).unwrap();
+            enc.finish().unwrap();
+        }
+        let kraken_path = tmpdir.join("kraken.tsv");
+        std::fs::write(&kraken_path, &kraken).unwrap();
+
+        let out_path = tmpdir.join(out_name);
+        let mut taxa = ahash::AHashSet::new();
+        taxa.insert(9606u32);
+
+        super::run_filter(super::FilterArgs {
+            input: in_path,
+            output: out_path.clone(),
+            taxon_ids: taxa,
+            per_record: true,
+            classifications: Some(kraken_path),
+            threads,
+            compression_level,
+            ..super::FilterArgs::default_for_test()
+        })
+        .unwrap();
+
+        let size = std::fs::metadata(&out_path).unwrap().len();
+        let f = std::fs::File::open(&out_path).unwrap();
+        let mut dec = flate2::bufread::MultiGzDecoder::new(std::io::BufReader::new(f));
+        let mut got = String::new();
+        dec.read_to_string(&mut got).unwrap();
+        (size, got)
+    }
+
+    #[test]
+    fn test_filter_fastq_gz_higher_compression_level_yields_smaller_file() {
+        // At a fixed thread count, raising --compression-level must shrink
+        // the file while leaving the decoded payload byte-for-byte identical.
+        let dir = tempfile::TempDir::new().unwrap();
+        let (size_low, content_low) = run_filter_fastq_gz(dir.path(), "low.fq.gz", 1, 1, 200);
+        let (size_high, content_high) = run_filter_fastq_gz(dir.path(), "high.fq.gz", 1, 9, 200);
+
+        assert_eq!(
+            content_low, content_high,
+            "decoded output must match across compression levels"
+        );
+        assert!(
+            size_high < size_low,
+            "expected level 9 ({size_high} bytes) < level 1 ({size_low} bytes)"
+        );
+    }
+
+    #[test]
+    fn test_filter_fastq_gz_threads_one_and_many_produce_identical_output() {
+        // At a fixed compression level, --threads must not change the decoded
+        // payload. (File sizes may differ slightly because the worker pool
+        // schedules block boundaries differently — that's expected and fine.)
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, content_serial) = run_filter_fastq_gz(dir.path(), "t1.fq.gz", 1, 5, 200);
+        let (_, content_parallel) = run_filter_fastq_gz(dir.path(), "t4.fq.gz", 4, 5, 200);
+
+        assert_eq!(
+            content_serial, content_parallel,
+            "decoded output must match across thread counts"
+        );
+    }
+
     #[test]
     fn test_filter_fasta_gz_input_plain_output() {
         use flate2::write::GzEncoder;
@@ -3636,6 +3764,8 @@ mod tests {
                 cram_reference: None,
                 keep_unannotated: false,
                 unordered: false,
+                threads: 1,
+                compression_level: 5,
             }
         }
     }
@@ -3762,7 +3892,7 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("plain.fq");
-        let mut sink = FastxSink::create(&p).unwrap();
+        let mut sink = FastxSink::create(&p, 1, 5).unwrap();
         sink.write_all(b"@r1\nACGT\n+\nIIII\n").unwrap();
         sink.flush().unwrap();
         sink.finalize().unwrap();
@@ -3777,7 +3907,7 @@ mod tests {
         use std::io::Write;
         let dir = tempfile::TempDir::new().unwrap();
         let p = dir.path().join("out.fq.gz");
-        let mut sink = FastxSink::create(&p).unwrap();
+        let mut sink = FastxSink::create(&p, 1, 5).unwrap();
         sink.write_all(b"@r1\nACGT\n+\nIIII\n").unwrap();
         sink.finalize().unwrap();
 
