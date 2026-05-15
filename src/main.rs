@@ -72,34 +72,32 @@ enum Commands {
 #[derive(Debug, Parser)]
 #[command(about, rename_all = "kebab-case")]
 struct PrepCmd {
-    /// Primary input file: FASTA, FASTQ (single-end or interleaved), SAM,
-    /// BAM, or CRAM. Accepted positionally (first argument) or as -1.
-    /// Use `-` or omit for stdin.
-    #[arg(index = 1, value_name = "FILE")]
-    input_positional: Option<PathBuf>,
+    /// Input file(s). For FASTA/FASTQ, one file (single-end or interleaved) or
+    /// two files (R1, R2 paired-end). For SAM/BAM/CRAM, exactly one file.
+    /// Accepted positionally or as -i/--input. Use `-` or omit for stdin
+    /// (single-input only).
+    #[arg(index = 1, value_name = "FILE", num_args = 0..=2)]
+    input_positional: Vec<PathBuf>,
 
-    /// Primary input file (flag form; equivalent to the positional argument).
-    /// Accepts FASTA, FASTQ (single-end or interleaved), SAM, BAM, or CRAM.
-    /// Use `-` for stdin.
-    #[arg(short = '1', long = "input-1", value_name = "FILE")]
-    input_flag: Option<PathBuf>,
-
-    /// R2 FASTQ or FASTA file. Only valid with FASTQ/FASTA primary input;
-    /// mutually exclusive with --per-record.
+    /// Input file(s) (flag form; equivalent to the positional arguments).
+    /// Accepts 1 file (single-end / interleaved FASTA/FASTQ or SAM/BAM/CRAM)
+    /// or 2 files (paired-end FASTA/FASTQ R1, R2). Use `-` for stdin
+    /// (single-input only).
     #[arg(
-        short = '2',
-        long = "input-2",
+        short = 'i',
+        long = "input",
         value_name = "FILE",
-        conflicts_with = "per_record"
+        num_args = 1..=2,
+        conflicts_with = "input_positional"
     )]
-    input2: Option<PathBuf>,
+    input_flag: Vec<PathBuf>,
 
     /// Disable auto pair-detection. Each FASTQ/FASTA record (or SAM/BAM/CRAM
     /// primary record) is emitted as its own single-end template, even when
     /// the input looks interleaved (`/1`/`/2` suffixes or matching mate names)
-    /// or query-grouped. Mutually exclusive with -2. Secondary (0x100) and
-    /// supplementary (0x800) alignments are always dropped, regardless of this
-    /// flag.
+    /// or query-grouped. Mutually exclusive with two-file input. Secondary
+    /// (0x100) and supplementary (0x800) alignments are always dropped,
+    /// regardless of this flag.
     #[arg(long)]
     per_record: bool,
 
@@ -178,16 +176,33 @@ struct AnnotateCmd {
 #[derive(Debug, Parser)]
 #[command(about, rename_all = "kebab-case")]
 struct FilterCmd {
-    /// Input SAM/BAM/CRAM or FASTA/FASTQ file. For SAM/BAM/CRAM, records should
-    /// be annotated with `ti` tags (via `krak annotate`). For FASTA/FASTQ,
-    /// supply taxon IDs with `--classifications` (-c). Use `-` or omit for stdin.
-    #[arg(short = 'i', long, default_value = "-")]
-    input: PathBuf,
+    /// Input file(s). For SAM/BAM/CRAM, one file annotated with `ti` tags
+    /// (via `krak annotate`). For FASTA/FASTQ, one file (single-end /
+    /// interleaved) or two files (R1, R2 paired-end); supply taxon IDs with
+    /// `--classifications` (-c). Accepted positionally or as -i/--input.
+    /// Use `-` or omit for stdin (single-input only).
+    #[arg(index = 1, value_name = "FILE", num_args = 0..=2)]
+    input_positional: Vec<PathBuf>,
 
-    /// Output file for passing records. Format matches input: SAM/BAM/CRAM for
-    /// alignment input, FASTA/FASTQ for FASTX input. Use `-` or omit for stdout.
-    #[arg(short = 'o', long, default_value = "-")]
-    output: PathBuf,
+    /// Input file(s) (flag form; equivalent to the positional arguments).
+    /// Accepts 1 file (SAM/BAM/CRAM or single-end / interleaved FASTA/FASTQ)
+    /// or 2 files (paired-end FASTA/FASTQ R1, R2). Use `-` for stdin
+    /// (single-input only).
+    #[arg(
+        short = 'i',
+        long = "input",
+        value_name = "FILE",
+        num_args = 1..=2,
+        conflicts_with = "input_positional"
+    )]
+    input_flag: Vec<PathBuf>,
+
+    /// Output file(s). Format matches input: SAM/BAM/CRAM for alignment input,
+    /// FASTA/FASTQ for FASTX input. One file for single-input mode, two files
+    /// for paired-end FASTA/FASTQ. Use `-` or omit for stdout (single-output
+    /// only).
+    #[arg(short = 'o', long = "output", value_name = "FILE", num_args = 1..=2)]
+    output: Vec<PathBuf>,
 
     /// Kraken report file. For SAM/BAM/CRAM, serves as fallback when no
     /// taxonomy tree is embedded in the header (embed one via `krak annotate
@@ -204,10 +219,11 @@ struct FilterCmd {
     #[arg(short = 't', long = "taxon-id", required = true)]
     taxon_ids: Vec<u32>,
 
-    /// Output file for rejected records. Format matches input: SAM/BAM/CRAM for
-    /// alignment input, FASTA/FASTQ for FASTX input.
-    #[arg(short = 'r', long)]
-    rejects: Option<PathBuf>,
+    /// Output file(s) for rejected records. Format matches input: SAM/BAM/CRAM
+    /// for alignment input, FASTA/FASTQ for FASTX input. One file for
+    /// single-input mode, two files for paired-end FASTA/FASTQ.
+    #[arg(short = 'r', long, value_name = "FILE", num_args = 1..=2)]
+    rejects: Vec<PathBuf>,
 
     /// Also keep reads assigned to ancestors of target taxon IDs.
     #[arg(short = 'a', long)]
@@ -386,10 +402,6 @@ fn resolve_output(path: PathBuf) -> PathBuf {
     resolve_dash(path, "/dev/stdout")
 }
 
-fn resolve_optional_output(path: Option<PathBuf>) -> Option<PathBuf> {
-    path.map(resolve_output)
-}
-
 /// Pick exactly one of a positional arg or its `--flag` equivalent. Defaults
 /// to the given pseudo-path (`/dev/stdin` / `/dev/stdout`) if both are absent;
 /// errors out the process if both are provided.
@@ -409,6 +421,110 @@ fn pick_one(
     }
 }
 
+/// Resolve a 1..=2 output list to a `(output, output2)` pair. Errors out if
+/// `paired` and the list has 1 element (or vice versa). Defaults to a single
+/// stdout pseudo-path when the list is empty.
+fn pick_output_pair(output: Vec<PathBuf>, paired: bool) -> (PathBuf, Option<PathBuf>) {
+    match (output.len(), paired) {
+        (0, false) => (PathBuf::from("/dev/stdout"), None),
+        (0, true) => {
+            error!("paired input requires two output paths via -o/--output");
+            process::exit(1);
+        }
+        (1, false) => (resolve_output(output.into_iter().next().unwrap()), None),
+        (1, true) => {
+            error!("paired input requires two output paths via -o/--output");
+            process::exit(1);
+        }
+        (2, false) => {
+            error!("two output paths supplied to -o/--output but input is single-end");
+            process::exit(1);
+        }
+        (2, true) => {
+            let mut it = output.into_iter();
+            let o1 = resolve_output(it.next().unwrap());
+            let o2 = it.next().unwrap();
+            if o2.as_os_str() == "-" {
+                error!("R2 output cannot be stdout (`-`)");
+                process::exit(1);
+            }
+            (o1, Some(o2))
+        }
+        _ => unreachable!("clap enforces num_args = 1..=2"),
+    }
+}
+
+/// Resolve a 0..=2 rejects list to `(rejects, rejects2)`. Same matching rules
+/// as outputs, except an empty list means "no rejects file".
+fn pick_rejects_pair(rejects: Vec<PathBuf>, paired: bool) -> (Option<PathBuf>, Option<PathBuf>) {
+    match (rejects.len(), paired) {
+        (0, _) => (None, None),
+        (1, false) => (
+            Some(resolve_output(rejects.into_iter().next().unwrap())),
+            None,
+        ),
+        (1, true) => {
+            error!("paired input requires two reject paths via -r/--rejects");
+            process::exit(1);
+        }
+        (2, false) => {
+            error!("two reject paths supplied to -r/--rejects but input is single-end");
+            process::exit(1);
+        }
+        (2, true) => {
+            let mut it = rejects.into_iter();
+            let r1 = resolve_output(it.next().unwrap());
+            let r2 = it.next().unwrap();
+            if r2.as_os_str() == "-" {
+                error!("R2 rejects cannot be stdout (`-`)");
+                process::exit(1);
+            }
+            (Some(r1), Some(r2))
+        }
+        _ => unreachable!("clap enforces num_args = 1..=2"),
+    }
+}
+
+/// Resolve a 1..=2 input list (positional or `--input`/`-i` flag form) to a
+/// `(input, input2)` pair. `clap`'s `conflicts_with` guarantees the two
+/// sources are mutually exclusive, so we pick whichever is non-empty.
+/// Defaults to a single stdin pseudo-path when both are empty. Errors out
+/// if `per_record` is set with two inputs.
+fn pick_input_pair(
+    positional: Vec<PathBuf>,
+    flag: Vec<PathBuf>,
+    flag_label: &str,
+    per_record: bool,
+) -> (PathBuf, Option<PathBuf>) {
+    let files = if !positional.is_empty() {
+        positional
+    } else {
+        flag
+    };
+    match files.len() {
+        0 => (PathBuf::from("/dev/stdin"), None),
+        1 => (resolve_input(files.into_iter().next().unwrap()), None),
+        2 => {
+            if per_record {
+                error!(
+                    "cannot use --per-record with two-file paired input \
+                     (positional or {flag_label})"
+                );
+                process::exit(1);
+            }
+            let mut it = files.into_iter();
+            let r1 = resolve_input(it.next().unwrap());
+            let r2 = it.next().unwrap();
+            if r2.as_os_str() == "-" {
+                error!("R2 input cannot be stdin (`-`)");
+                process::exit(1);
+            }
+            (r1, Some(r2))
+        }
+        _ => unreachable!("clap enforces num_args = 0..=2 / 1..=2"),
+    }
+}
+
 /// Main binary entrypoint.
 #[cfg(not(tarpaulin_include))]
 fn main() -> Result<(), Error> {
@@ -420,10 +536,11 @@ fn main() -> Result<(), Error> {
 
     let result = match cli.command {
         Commands::Prep(cmd) => {
-            let input = pick_one(cmd.input_positional, cmd.input_flag, "-1", "/dev/stdin");
+            let (input, input2) =
+                pick_input_pair(cmd.input_positional, cmd.input_flag, "-i", cmd.per_record);
             kraklib::run_prep(PrepArgs {
                 input,
-                input2: cmd.input2,
+                input2,
                 per_record: cmd.per_record,
                 output: resolve_output(cmd.output),
                 cram_reference: cmd.cram_reference,
@@ -440,28 +557,37 @@ fn main() -> Result<(), Error> {
             threads: cmd.threads as usize,
             compression_level: cmd.compression_level as u32,
         }),
-        Commands::Filter(cmd) => kraklib::run_filter(FilterArgs {
-            input: resolve_input(cmd.input),
-            output: resolve_output(cmd.output),
-            kraken_report: cmd.kraken_report,
-            metrics: cmd.metrics,
-            taxon_ids: cmd.taxon_ids.into_iter().collect(),
-            rejects: resolve_optional_output(cmd.rejects),
-            allow_ancestors: cmd.allow_ancestors,
-            rescue_max_edit_distance: cmd.rescue_max_edit_distance,
-            rescue_max_indels: cmd.rescue_max_indels,
-            rescue_max_indel_length: cmd.rescue_max_indel_length,
-            rescue_n_adjustment: cmd.rescue_n_adjustment,
-            per_record: cmd.per_record,
-            classifications: cmd.classifications,
-            include_descendants: cmd.include_descendants,
-            include_unclassified: cmd.include_unclassified,
-            cram_reference: cmd.cram_reference,
-            keep_unannotated: cmd.keep_unannotated,
-            unordered: cmd.unordered,
-            threads: cmd.threads as usize,
-            compression_level: cmd.compression_level as u32,
-        }),
+        Commands::Filter(cmd) => {
+            let (input, input2) =
+                pick_input_pair(cmd.input_positional, cmd.input_flag, "-i", cmd.per_record);
+            let (output, output2) = pick_output_pair(cmd.output, input2.is_some());
+            let (rejects, rejects2) = pick_rejects_pair(cmd.rejects, input2.is_some());
+            kraklib::run_filter(FilterArgs {
+                input,
+                input2,
+                output,
+                output2,
+                kraken_report: cmd.kraken_report,
+                metrics: cmd.metrics,
+                taxon_ids: cmd.taxon_ids.into_iter().collect(),
+                rejects,
+                rejects2,
+                allow_ancestors: cmd.allow_ancestors,
+                rescue_max_edit_distance: cmd.rescue_max_edit_distance,
+                rescue_max_indels: cmd.rescue_max_indels,
+                rescue_max_indel_length: cmd.rescue_max_indel_length,
+                rescue_n_adjustment: cmd.rescue_n_adjustment,
+                per_record: cmd.per_record,
+                classifications: cmd.classifications,
+                include_descendants: cmd.include_descendants,
+                include_unclassified: cmd.include_unclassified,
+                cram_reference: cmd.cram_reference,
+                keep_unannotated: cmd.keep_unannotated,
+                unordered: cmd.unordered,
+                threads: cmd.threads as usize,
+                compression_level: cmd.compression_level as u32,
+            })
+        }
         Commands::N2Ref(cmd) => {
             let input = pick_one(cmd.input_positional, cmd.input_flag, "-i", "/dev/stdin");
             let output = pick_one(cmd.output_positional, cmd.output_flag, "-o", "/dev/stdout");

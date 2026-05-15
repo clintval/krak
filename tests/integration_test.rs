@@ -178,7 +178,7 @@ fn test_prep_single_end_fastq_flag() {
     krak()
         .args([
             "prep",
-            "-1",
+            "-i",
             input.path().to_str().unwrap(),
             "-o",
             output.path().to_str().unwrap(),
@@ -232,9 +232,8 @@ fn test_prep_paired_fastq() {
     krak()
         .args([
             "prep",
-            "-1",
+            "-i",
             r1.path().to_str().unwrap(),
-            "-2",
             r2.path().to_str().unwrap(),
             "-o",
             output.path().to_str().unwrap(),
@@ -320,9 +319,8 @@ fn test_prep_per_record_and_input2_together_is_error() {
     krak()
         .args([
             "prep",
-            "-1",
+            "-i",
             r1.path().to_str().unwrap(),
-            "-2",
             r2.path().to_str().unwrap(),
             "--per-record",
             "-o",
@@ -341,9 +339,8 @@ fn test_prep_input2_with_sam_is_error() {
     krak()
         .args([
             "prep",
-            "-1",
+            "-i",
             input.path().to_str().unwrap(),
-            "-2",
             r2.path().to_str().unwrap(),
             "-o",
             output.path().to_str().unwrap(),
@@ -821,6 +818,270 @@ fn test_filter_fastq_rejects_file() {
         !rejects_out.contains("@r1\n"),
         "kept read should not be in rejects: {rejects_out}"
     );
+}
+
+#[test]
+fn test_filter_paired_fastq() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII"), ("p2", "CCCC", "JJJJ")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII"), ("p2", "GGGG", "JJJJ")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606), ("p2", 1234)]);
+    let out1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let out2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            "-i",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out1.path().to_str().unwrap(),
+            out2.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .success();
+
+    let out1_body = std::fs::read_to_string(out1.path()).unwrap();
+    let out2_body = std::fs::read_to_string(out2.path()).unwrap();
+    assert!(
+        out1_body.contains("@p1\n"),
+        "R1 kept missing p1: {out1_body}"
+    );
+    assert!(
+        out2_body.contains("@p1\n"),
+        "R2 kept missing p1: {out2_body}"
+    );
+    assert!(
+        !out1_body.contains("@p2\n"),
+        "R1 rejected p2 leaked: {out1_body}"
+    );
+    assert!(
+        !out2_body.contains("@p2\n"),
+        "R2 rejected p2 leaked: {out2_body}"
+    );
+}
+
+#[test]
+fn test_filter_paired_fastq_positional() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII"), ("p2", "CCCC", "JJJJ")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII"), ("p2", "GGGG", "JJJJ")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606), ("p2", 1234)]);
+    let out1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let out2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out1.path().to_str().unwrap(),
+            out2.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .success();
+
+    let out1_body = std::fs::read_to_string(out1.path()).unwrap();
+    let out2_body = std::fs::read_to_string(out2.path()).unwrap();
+    assert!(out1_body.contains("@p1\n"));
+    assert!(out2_body.contains("@p1\n"));
+    assert!(!out1_body.contains("@p2\n"));
+    assert!(!out2_body.contains("@p2\n"));
+}
+
+#[test]
+fn test_filter_paired_fastq_with_rejects() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII"), ("p2", "CCCC", "JJJJ")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII"), ("p2", "GGGG", "JJJJ")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606), ("p2", 1234)]);
+    let out1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let out2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let rej1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let rej2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            "-i",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out1.path().to_str().unwrap(),
+            out2.path().to_str().unwrap(),
+            "-r",
+            rej1.path().to_str().unwrap(),
+            rej2.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .success();
+
+    let rej1_body = std::fs::read_to_string(rej1.path()).unwrap();
+    let rej2_body = std::fs::read_to_string(rej2.path()).unwrap();
+    assert!(
+        rej1_body.contains("@p2\n"),
+        "R1 rejects should have p2: {rej1_body}"
+    );
+    assert!(
+        rej2_body.contains("@p2\n"),
+        "R2 rejects should have p2: {rej2_body}"
+    );
+    assert!(!rej1_body.contains("@p1\n"));
+    assert!(!rej2_body.contains("@p1\n"));
+}
+
+#[test]
+fn test_filter_paired_requires_two_outputs() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606)]);
+    let out = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            "-i",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_filter_paired_per_record_is_error() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606)]);
+    let out1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let out2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            "-i",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out1.path().to_str().unwrap(),
+            out2.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "--per-record",
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn test_filter_paired_unequal_lengths_is_error() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII"), ("p2", "CCCC", "JJJJ")]);
+    let r2 = write_tmp_fastq(&[("p1", "TTTT", "IIII")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606), ("p2", 1234)]);
+    let out1 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+    let out2 = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            "-i",
+            r1.path().to_str().unwrap(),
+            r2.path().to_str().unwrap(),
+            "-o",
+            out1.path().to_str().unwrap(),
+            out2.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicates::str::contains("unequal record counts"));
+}
+
+#[test]
+fn test_filter_positional_and_flag_conflict_fails() {
+    let r1 = write_tmp_fastq(&[("p1", "AAAA", "IIII")]);
+    let kraken_out = write_tmp_classifications(&[("p1", 9606)]);
+    let out = tempfile::Builder::new()
+        .suffix(".fastq")
+        .tempfile()
+        .unwrap();
+
+    krak()
+        .args([
+            "filter",
+            r1.path().to_str().unwrap(),
+            "-i",
+            r1.path().to_str().unwrap(),
+            "-o",
+            out.path().to_str().unwrap(),
+            "-c",
+            kraken_out.path().to_str().unwrap(),
+            "-t",
+            "9606",
+        ])
+        .assert()
+        .failure();
 }
 
 #[test]
@@ -1530,7 +1791,7 @@ fn prep_reads_gzipped_fastq_file() {
 
     krak()
         .arg("prep")
-        .arg("-1")
+        .arg("-i")
         .arg(in_fq_gz.path())
         .arg("-o")
         .arg(out.path())
@@ -1624,7 +1885,7 @@ fn prep_reads_gzipped_stdin() {
 
     krak()
         .arg("prep")
-        .arg("-1")
+        .arg("-i")
         .arg("-")
         .arg("-o")
         .arg(out.path())
@@ -1642,7 +1903,7 @@ fn prep_reads_plain_fastq_stdin() {
 
     krak()
         .arg("prep")
-        .arg("-1")
+        .arg("-i")
         .arg("-")
         .arg("-o")
         .arg(out.path())
@@ -1868,7 +2129,7 @@ fn prep_reads_bam_stdin() {
 
     krak()
         .arg("prep")
-        .arg("-1")
+        .arg("-i")
         .arg("-")
         .arg("-o")
         .arg(out.path())
