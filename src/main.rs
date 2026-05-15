@@ -161,6 +161,17 @@ struct AnnotateCmd {
     /// input.
     #[arg(long)]
     cram_reference: Option<PathBuf>,
+
+    /// Number of bgzf compression worker threads for BAM output. At 1
+    /// (default), one compressor + one writer thread pipeline with the
+    /// annotation loop. Ignored for SAM (no compression) and CRAM (per-block
+    /// codecs).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    threads: u16,
+
+    /// bgzf compression level (0-9) for BAM output. Ignored for SAM and CRAM.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=9))]
+    compression_level: u8,
 }
 
 /// Arguments for the `filter` subcommand.
@@ -276,6 +287,17 @@ struct FilterCmd {
     /// input; SAM/BAM/CRAM input reads taxon IDs from `ti` tags.
     #[arg(long)]
     unordered: bool,
+
+    /// Number of bgzf compression worker threads for `.gz` outputs. At 1
+    /// (default), one compressor + one writer thread pipeline with the main
+    /// filter loop; higher values fan compression out across more workers.
+    /// SAM and CRAM outputs ignore this value.
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    threads: u16,
+
+    /// bgzf compression level (0-9) for `.gz` outputs.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=9))]
+    compression_level: u8,
 }
 
 /// Arguments for the `n2ref` subcommand.
@@ -309,6 +331,17 @@ struct N2RefCmd {
     /// Replacement base quality score for converted N-calls (0–93). Defaults to original quality.
     #[arg(short = 'q', long)]
     qual: Option<u8>,
+
+    /// Number of bgzf compression worker threads for BAM output. At 1
+    /// (default), one compressor + one writer thread pipeline with the
+    /// n2ref loop. Ignored for SAM (no compression) and CRAM (per-block
+    /// codecs).
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u16).range(1..))]
+    threads: u16,
+
+    /// bgzf compression level (0-9) for BAM output. Ignored for SAM and CRAM.
+    #[arg(long, default_value_t = 5, value_parser = clap::value_parser!(u8).range(0..=9))]
+    compression_level: u8,
 }
 
 /// Arguments for the `report2tsv` subcommand.
@@ -404,6 +437,8 @@ fn main() -> Result<(), Error> {
             kraken_db: cmd.kraken_db,
             unordered: cmd.unordered,
             cram_reference: cmd.cram_reference,
+            threads: cmd.threads as usize,
+            compression_level: cmd.compression_level as u32,
         }),
         Commands::Filter(cmd) => kraklib::run_filter(FilterArgs {
             input: resolve_input(cmd.input),
@@ -424,6 +459,8 @@ fn main() -> Result<(), Error> {
             cram_reference: cmd.cram_reference,
             keep_unannotated: cmd.keep_unannotated,
             unordered: cmd.unordered,
+            threads: cmd.threads as usize,
+            compression_level: cmd.compression_level as u32,
         }),
         Commands::N2Ref(cmd) => {
             let input = pick_one(cmd.input_positional, cmd.input_flag, "-i", "/dev/stdin");
@@ -433,6 +470,8 @@ fn main() -> Result<(), Error> {
                 output,
                 reference: cmd.reference,
                 qual: cmd.qual,
+                threads: cmd.threads as usize,
+                compression_level: cmd.compression_level as u32,
             })
         }
         Commands::Report2Tsv(cmd) => {

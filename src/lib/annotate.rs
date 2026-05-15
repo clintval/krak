@@ -37,6 +37,13 @@ pub struct AnnotateArgs {
     pub unordered: bool,
     /// Optional reference FASTA for CRAM decompression (requires `.fai` index).
     pub cram_reference: Option<std::path::PathBuf>,
+    /// Number of bgzf compression worker threads for BAM output. Default 1
+    /// (one compressor + one writer thread pipelined with the annotation loop).
+    /// Ignored for SAM (no compression) and CRAM (per-block codecs).
+    pub threads: usize,
+    /// bgzf compression level (0-9) for BAM output. Default 5. Ignored for
+    /// SAM (no compression) and CRAM (per-block codecs).
+    pub compression_level: u32,
 }
 
 /// Source of taxon-id assignments for the annotation loop.
@@ -130,14 +137,35 @@ pub fn run_annotate(args: AnnotateArgs) -> Result<()> {
                 use noodles::bam;
                 use noodles::bgzf;
                 let mut reader = bam::io::Reader::from(bgzf::io::Reader::new(peek_reader));
-                annotate_bam_from_reader(&mut reader, &args.output, source, &header_comments)
+                annotate_bam_from_reader(
+                    &mut reader,
+                    &args.output,
+                    source,
+                    &header_comments,
+                    args.threads,
+                    args.compression_level,
+                )
             }
-            _ => annotate_bam(&args.input, &args.output, source, &header_comments),
+            _ => annotate_bam(
+                &args.input,
+                &args.output,
+                source,
+                &header_comments,
+                args.threads,
+                args.compression_level,
+            ),
         };
     }
 
     match fmt {
-        AlignmentFormat::Bam => annotate_bam(&args.input, &args.output, source, &header_comments),
+        AlignmentFormat::Bam => annotate_bam(
+            &args.input,
+            &args.output,
+            source,
+            &header_comments,
+            args.threads,
+            args.compression_level,
+        ),
         AlignmentFormat::Cram => annotate_cram(
             &args.input,
             &args.output,
@@ -154,9 +182,18 @@ fn annotate_bam(
     output: &Path,
     source: Source<'_>,
     header_comments: &[String],
+    threads: usize,
+    compression_level: u32,
 ) -> Result<()> {
     let mut reader = crate::open_bam_reader(input)?;
-    annotate_bam_from_reader(&mut reader, output, source, header_comments)
+    annotate_bam_from_reader(
+        &mut reader,
+        output,
+        source,
+        header_comments,
+        threads,
+        compression_level,
+    )
 }
 
 fn annotate_bam_from_reader<R: std::io::Read>(
@@ -164,6 +201,8 @@ fn annotate_bam_from_reader<R: std::io::Read>(
     output: &Path,
     source: Source<'_>,
     header_comments: &[String],
+    threads: usize,
+    compression_level: u32,
 ) -> Result<()> {
     use noodles::bam;
 
@@ -172,9 +211,14 @@ fn annotate_bam_from_reader<R: std::io::Read>(
         header.add_comment(c.clone());
     }
 
-    let mut writer = bam::io::writer::Builder
-        .build_from_path(output)
+    let file = std::fs::File::create(output)
         .with_context(|| format!("failed to create BAM file: {}", output.display()))?;
+    let parz = gzp::par::compress::ParCompressBuilder::<gzp::deflate::Bgzf>::new()
+        .num_threads(threads.max(1))
+        .with_context(|| "invalid --threads value for BAM bgzf writer")?
+        .compression_level(gzp::Compression::new(compression_level))
+        .from_writer(file);
+    let mut writer = bam::io::Writer::from(parz);
     writer
         .write_header(&header)
         .context("failed to write BAM header")?;
@@ -188,10 +232,11 @@ fn annotate_bam_from_reader<R: std::io::Read>(
         output,
         Some(AlignmentFormat::Bam),
         |w, _| {
-            w.into_inner()
-                .finish()
-                .context("failed to finish BAM BGZF stream")
-                .map(|_| ())
+            use gzp::ZWriter as _;
+            let mut parz = w.into_inner();
+            parz.finish()
+                .map_err(|e| anyhow::anyhow!("failed to finish BAM BGZF stream: {e}"))?;
+            Ok(())
         },
     )
 }
@@ -471,6 +516,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -485,6 +532,102 @@ mod tests {
             Some(Value::Int32(n)) => assert_eq!(*n, 9606),
             other => panic!("expected Int32 (SAM type 'i'); got: {:?}", other),
         }
+    }
+
+    /// Write a single-record BAM, then run `annotate` writing to `out_name`
+    /// with the given `threads` and `compression_level`. Returns the output
+    /// file size in bytes and the round-tripped `ti` tag value.
+    fn run_annotate_bam(
+        tmpdir: &std::path::Path,
+        out_name: &str,
+        threads: usize,
+        compression_level: u32,
+    ) -> (u64, i32) {
+        use noodles::bam;
+        use noodles::sam;
+        use noodles::sam::alignment::io::Write as _;
+        use noodles::sam::alignment::record_buf::{QualityScores, RecordBuf, Sequence};
+        use std::io::Write as _;
+
+        let in_bam = tmpdir.join("in.bam");
+        let header = sam::Header::default();
+        {
+            let mut w = bam::io::writer::Builder.build_from_path(&in_bam).unwrap();
+            w.write_header(&header).unwrap();
+            // A few records with varied sequences give the compressor enough
+            // material that level 1 vs 9 differ measurably while staying tiny.
+            for i in 0..32 {
+                let name = format!("read{i}");
+                let mut r = RecordBuf::default();
+                *r.name_mut() = Some(name.as_bytes().into());
+                let bases: Vec<u8> = (0..96)
+                    .map(|j| match (i + j) % 4 {
+                        0 => b'A',
+                        1 => b'C',
+                        2 => b'G',
+                        _ => b'T',
+                    })
+                    .collect();
+                *r.sequence_mut() = Sequence::from(bases.clone());
+                *r.quality_scores_mut() = QualityScores::from(vec![30u8; bases.len()]);
+                w.write_alignment_record(&header, &r).unwrap();
+            }
+            w.into_inner().finish().unwrap();
+        }
+
+        let assignments = tmpdir.join("assignments.txt");
+        {
+            let mut f = std::fs::File::create(&assignments).unwrap();
+            for i in 0..32 {
+                writeln!(f, "C\tread{i}\t9606\t96\t9606:1").unwrap();
+            }
+        }
+
+        let out_bam = tmpdir.join(out_name);
+        super::run_annotate(super::AnnotateArgs {
+            input: in_bam,
+            assignments,
+            output: out_bam.clone(),
+            kraken_report: None,
+            kraken_db: None,
+            unordered: true,
+            cram_reference: None,
+            threads,
+            compression_level,
+        })
+        .unwrap();
+
+        let size = std::fs::metadata(&out_bam).unwrap().len();
+        let mut reader = crate::open_bam_reader(&out_bam).unwrap();
+        let h = reader.read_header().unwrap();
+        let first: RecordBuf = reader.record_bufs(&h).next().unwrap().unwrap();
+        let ti = match first.data().get(&crate::TI_TAG) {
+            Some(Value::Int32(n)) => *n,
+            other => panic!("expected Int32 ti tag; got {other:?}"),
+        };
+        (size, ti)
+    }
+
+    #[test]
+    fn test_annotate_bam_higher_compression_level_yields_smaller_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (size_low, ti_low) = run_annotate_bam(dir.path(), "low.bam", 1, 1);
+        let (size_high, ti_high) = run_annotate_bam(dir.path(), "high.bam", 1, 9);
+        assert_eq!(ti_low, 9606);
+        assert_eq!(ti_high, 9606);
+        assert!(
+            size_high < size_low,
+            "expected level 9 ({size_high} bytes) < level 1 ({size_low} bytes)"
+        );
+    }
+
+    #[test]
+    fn test_annotate_bam_threads_one_and_many_round_trip_identically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, ti_serial) = run_annotate_bam(dir.path(), "t1.bam", 1, 5);
+        let (_, ti_parallel) = run_annotate_bam(dir.path(), "t4.bam", 4, 5);
+        assert_eq!(ti_serial, 9606);
+        assert_eq!(ti_parallel, 9606);
     }
 
     #[test]
@@ -536,6 +679,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -599,6 +744,8 @@ mod tests {
             kraken_db: None,
             unordered: false,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -657,6 +804,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -709,6 +858,8 @@ mod tests {
             kraken_db: None,
             unordered: false,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -764,6 +915,8 @@ mod tests {
             kraken_db: None,
             unordered: false,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -818,6 +971,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -875,6 +1030,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -935,6 +1092,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -988,6 +1147,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1028,6 +1189,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("not present in the assignments"));
@@ -1071,6 +1234,8 @@ mod tests {
             kraken_db: None,
             unordered: true,
             cram_reference: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 

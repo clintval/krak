@@ -21,6 +21,13 @@ pub struct N2RefArgs {
     pub reference: std::path::PathBuf,
     /// Replacement quality score for converted N-calls (`None` = keep original).
     pub qual: Option<u8>,
+    /// Number of bgzf compression worker threads for BAM output. Default 1
+    /// (one compressor + one writer thread pipelined with the n2ref loop).
+    /// Ignored for SAM (no compression) and CRAM (per-block codecs).
+    pub threads: usize,
+    /// bgzf compression level (0-9) for BAM output. Default 5. Ignored for
+    /// SAM (no compression) and CRAM (per-block codecs).
+    pub compression_level: u32,
 }
 
 /// Type alias for the indexed FASTA reader used to fetch reference bases.
@@ -121,13 +128,19 @@ fn n2ref_bam_with_reader<R: std::io::Read>(
     mut reader: noodles::bam::io::Reader<R>,
     ref_reader: &mut RefReader,
 ) -> Result<()> {
+    use gzp::ZWriter as _;
     use noodles::bam;
 
     let header = reader.read_header().context("failed to read BAM header")?;
 
-    let mut writer = bam::io::writer::Builder
-        .build_from_path(&args.output)
+    let file = std::fs::File::create(&args.output)
         .with_context(|| format!("failed to create output BAM: {}", args.output.display()))?;
+    let parz = gzp::par::compress::ParCompressBuilder::<gzp::deflate::Bgzf>::new()
+        .num_threads(args.threads.max(1))
+        .context("invalid --threads value for BAM bgzf writer")?
+        .compression_level(gzp::Compression::new(args.compression_level))
+        .from_writer(file);
+    let mut writer = bam::io::Writer::from(parz);
     writer
         .write_header(&header)
         .context("failed to write BAM header")?;
@@ -143,7 +156,7 @@ fn n2ref_bam_with_reader<R: std::io::Read>(
     writer
         .into_inner()
         .finish()
-        .context("failed to finish BAM BGZF stream")?;
+        .map_err(|e| anyhow::anyhow!("failed to finish BAM BGZF stream: {e}"))?;
     Ok(())
 }
 
@@ -670,6 +683,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -683,6 +698,89 @@ mod tests {
         assert_eq!(recs.len(), 1);
         let new_seq: Vec<u8> = recs[0].sequence().as_ref().to_vec();
         assert_eq!(&new_seq, b"ACGT");
+    }
+
+    /// Build a BAM with 32 mapped records (each containing an N to revert),
+    /// then run `n2ref` writing to `out_name` with the given `threads` /
+    /// `compression_level`. Returns (file size in bytes, count of records
+    /// whose SEQ was successfully reverted to the reference `A` at position 1).
+    fn run_n2ref_bam(
+        tmpdir: &std::path::Path,
+        out_name: &str,
+        threads: usize,
+        compression_level: u32,
+    ) -> (u64, usize) {
+        use noodles::bam;
+        use noodles::sam;
+        use noodles::sam::alignment::io::Write as _;
+
+        // 32-base reference of pure A's gives the compressor predictable
+        // redundancy across records (so level 1 vs 9 differ measurably).
+        let fa_path = tmpdir.join("ref.fa");
+        let fai_path = tmpdir.join("ref.fa.fai");
+        std::fs::write(&fa_path, b">chr1\nAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\n").unwrap();
+        std::fs::write(&fai_path, b"chr1\t32\t6\t32\t33\n").unwrap();
+
+        let in_path = tmpdir.join("in.bam");
+        let header: sam::Header = "@HD\tVN:1.6\n@SQ\tSN:chr1\tLN:32\n".parse().unwrap();
+        {
+            let mut w = bam::io::writer::Builder.build_from_path(&in_path).unwrap();
+            w.write_header(&header).unwrap();
+            for _ in 0..32 {
+                // SEQ starts with N at pos 1, which n2ref must revert to 'A'.
+                let r = make_mapped_record(
+                    b"NAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                    &[30u8; 32],
+                    vec![Op::new(Kind::Match, 32)],
+                    0,
+                    1,
+                );
+                w.write_alignment_record(&header, &r).unwrap();
+            }
+        }
+
+        let out_path = tmpdir.join(out_name);
+        run_n2ref(N2RefArgs {
+            input: in_path,
+            output: out_path.clone(),
+            reference: fa_path,
+            qual: None,
+            threads,
+            compression_level,
+        })
+        .unwrap();
+
+        let size = std::fs::metadata(&out_path).unwrap().len();
+        let mut r = bam::io::reader::Builder.build_from_path(&out_path).unwrap();
+        let h = r.read_header().unwrap();
+        let reverted = r
+            .record_bufs(&h)
+            .map(|res| res.unwrap())
+            .filter(|rec| rec.sequence().as_ref().first().copied() == Some(b'A'))
+            .count();
+        (size, reverted)
+    }
+
+    #[test]
+    fn test_n2ref_bam_higher_compression_level_yields_smaller_file() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (size_low, reverted_low) = run_n2ref_bam(dir.path(), "low.bam", 1, 1);
+        let (size_high, reverted_high) = run_n2ref_bam(dir.path(), "high.bam", 1, 9);
+        assert_eq!(reverted_low, 32);
+        assert_eq!(reverted_high, 32);
+        assert!(
+            size_high < size_low,
+            "expected level 9 ({size_high} bytes) < level 1 ({size_low} bytes)"
+        );
+    }
+
+    #[test]
+    fn test_n2ref_bam_threads_one_and_many_round_trip_identically() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let (_, reverted_serial) = run_n2ref_bam(dir.path(), "t1.bam", 1, 5);
+        let (_, reverted_parallel) = run_n2ref_bam(dir.path(), "t4.bam", 4, 5);
+        assert_eq!(reverted_serial, 32);
+        assert_eq!(reverted_parallel, 32);
     }
 
     #[test]
@@ -704,6 +802,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: Some(40),
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -746,6 +846,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -784,6 +886,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
         // Output must be a valid CRAM that can be reopened.
@@ -814,6 +918,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
         let mut reader = crate::open_cram_reader(&out_path, None).unwrap();
@@ -847,6 +953,8 @@ mod tests {
             output: out_path.clone(),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
@@ -873,6 +981,8 @@ mod tests {
             output: dir.path().join("out.sam"),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("requires SAM/BAM/CRAM"));
@@ -890,6 +1000,8 @@ mod tests {
             output: dir.path().join("out.sam"),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap_err();
         assert!(format!("{err:#}").contains("could not infer format"));
@@ -904,6 +1016,8 @@ mod tests {
             output: dir.path().join("out.bam"),
             reference: fa_path,
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap_err();
         let msg = format!("{err:#}");
@@ -1027,6 +1141,8 @@ mod tests {
             output: out_cram.clone(),
             reference: fa_path.clone(),
             qual: None,
+            threads: 1,
+            compression_level: 5,
         })
         .unwrap();
 
