@@ -2485,6 +2485,8 @@ mod tests {
                 taxon_id: 1,
                 name: "root".to_owned(),
                 indent: 0,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
             KrakenReportEntry {
                 pct_fragments: 0.0,
@@ -2494,6 +2496,8 @@ mod tests {
                 taxon_id: 9606,
                 name: "Homo sapiens".to_owned(),
                 indent: 2,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
         ];
         let tree = KrakenTaxonomyTree::from_entries(&entries).unwrap();
@@ -2676,6 +2680,8 @@ mod tests {
                 taxon_id: 1,
                 name: "root".to_owned(),
                 indent: 0,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
             KrakenReportEntry {
                 pct_fragments: 0.0,
@@ -2685,6 +2691,8 @@ mod tests {
                 taxon_id: 9606,
                 name: "Homo sapiens".to_owned(),
                 indent: 2,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
         ];
         let tree = KrakenTaxonomyTree::from_entries(&entries).unwrap();
@@ -2780,6 +2788,8 @@ mod tests {
                 taxon_id: 1,
                 name: "root".to_owned(),
                 indent: 0,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
             KrakenReportEntry {
                 pct_fragments: 0.0,
@@ -2789,6 +2799,8 @@ mod tests {
                 taxon_id: 9606,
                 name: "Homo sapiens".to_owned(),
                 indent: 2,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
         ];
         let tree = KrakenTaxonomyTree::from_entries(&entries).unwrap();
@@ -3049,6 +3061,8 @@ mod tests {
                 taxon_id: 1,
                 name: "root".to_owned(),
                 indent: 0,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
             KrakenReportEntry {
                 pct_fragments: 0.0,
@@ -3058,6 +3072,8 @@ mod tests {
                 taxon_id: 9606,
                 name: "human".to_owned(),
                 indent: 2,
+                minimizer_count: None,
+                distinct_minimizer_count: None,
             },
         ];
         let tree = KrakenTaxonomyTree::from_entries(&entries).unwrap();
@@ -3095,6 +3111,8 @@ mod tests {
             taxon_id: 1,
             name: "root".to_owned(),
             indent: 0,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         }];
         let tree = KrakenTaxonomyTree::from_entries(&entries).unwrap();
         let initial: AHashSet<u32> = [9999u32].into_iter().collect();

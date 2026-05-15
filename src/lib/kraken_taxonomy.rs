@@ -242,6 +242,8 @@ pub fn read_taxo_k2d(path: &Path) -> Result<Vec<KrakenReportEntry>> {
             taxon_id: node.external_id as u32,
             name: cstr_at(&name_data, node.name_offset as usize)?.to_owned(),
             indent: depth * SPACES_PER_DEPTH,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         });
 
         // Push children in reverse order so the first child is processed first.
@@ -335,6 +337,8 @@ pub fn read_taxonomy_dmp(db_path: &Path) -> Result<Vec<KrakenReportEntry>> {
             taxon_id: id,
             name,
             indent: depth * SPACES_PER_DEPTH,
+            minimizer_count: None,
+            distinct_minimizer_count: None,
         });
         if let Some(children) = children_of.get(&id) {
             // Reverse so the smallest taxon ID is processed first.
