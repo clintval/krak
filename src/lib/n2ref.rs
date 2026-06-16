@@ -145,18 +145,23 @@ fn n2ref_bam_with_reader<R: std::io::Read>(
         .write_header(&header)
         .context("failed to write BAM header")?;
 
-    process_records(
+    // Finalize the BGZF stream unconditionally, even if the loop errored: a
+    // threaded gzp writer dropped without an explicit finish panics in its Drop
+    // and masks the real error. `finish_after` preserves the loop's error.
+    let body = process_records(
         reader.record_bufs(&header),
         &header,
         &mut writer,
         ref_reader,
         args.qual,
-    )?;
-
-    writer
-        .into_inner()
-        .finish()
-        .map_err(|e| anyhow::anyhow!("failed to finish BAM BGZF stream: {e}"))?;
+    );
+    crate::finish_after(body, || {
+        writer
+            .into_inner()
+            .finish()
+            .map(|_| ())
+            .map_err(|e| anyhow::anyhow!("failed to finish BAM BGZF stream: {e}"))
+    })?;
     Ok(())
 }
 
@@ -176,21 +181,23 @@ fn n2ref_sam_with_reader<R: std::io::BufRead>(
         .write_header(&header)
         .context("failed to write SAM header")?;
 
-    process_records(
+    // Flush unconditionally, even if the loop errored, so a partial SAM is
+    // flushed (and a flush error surfaces) rather than left in the unflushed
+    // buffer. The loop's error takes precedence.
+    let body = process_records(
         reader.record_bufs(&header),
         &header,
         &mut writer,
         ref_reader,
         args.qual,
-    )?;
-
-    {
+    );
+    crate::finish_after(body, || {
         use std::io::Write as _;
         writer
             .into_inner()
             .flush()
-            .context("failed to flush SAM writer")?;
-    }
+            .context("failed to flush SAM writer")
+    })?;
     Ok(())
 }
 
@@ -206,17 +213,21 @@ fn n2ref_cram_with_reader<R: std::io::Read>(
         .write_header(&header)
         .context("failed to write CRAM header")?;
 
-    process_records(
+    // Finish the CRAM writer unconditionally, even if the loop errored, so a
+    // partial CRAM still gets its EOF container (and a finish error surfaces).
+    // The loop's error takes precedence.
+    let body = process_records(
         reader.records(&header),
         &header,
         &mut writer,
         ref_reader,
         args.qual,
-    )?;
-
-    writer
-        .try_finish(&header)
-        .context("failed to finish CRAM writer")?;
+    );
+    crate::finish_after(body, || {
+        writer
+            .try_finish(&header)
+            .context("failed to finish CRAM writer")
+    })?;
     Ok(())
 }
 

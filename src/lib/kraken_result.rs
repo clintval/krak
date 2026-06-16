@@ -262,17 +262,18 @@ impl<R: BufRead> StreamingLookup<R> {
 
     /// Count assignments that were left in the buffer or never read off the
     /// stream after the input was fully consumed. Drains the remaining stream.
-    pub(crate) fn count_unconsumed(&mut self) -> usize {
+    pub(crate) fn count_unconsumed(&mut self) -> Result<usize> {
         let mut n = self.lookahead.len();
         self.lookahead.clear();
         while !self.exhausted {
-            match self.next_kraken() {
-                Ok(Some(_)) => n += 1,
-                Ok(None) => {} // next_kraken sets exhausted = true on EOF.
-                Err(_) => break,
+            // `next_kraken` sets `exhausted = true` and returns `Ok(None)` on
+            // EOF; a malformed line propagates rather than being swallowed
+            // (which would also undercount the leftovers).
+            if self.next_kraken()?.is_some() {
+                n += 1;
             }
         }
-        n
+        Ok(n)
     }
 }
 
@@ -501,7 +502,7 @@ mod tests {
         let kraken = "C\tr1\t1\t100\t1:5\nC\tr2\t2\t100\t2:5\nC\tr3\t3\t100\t3:5\n";
         let mut s = streaming(kraken);
         assert_eq!(s.lookup("r1").unwrap(), Some(1));
-        assert_eq!(s.count_unconsumed(), 2);
+        assert_eq!(s.count_unconsumed().unwrap(), 2);
     }
 
     #[test]
@@ -509,7 +510,24 @@ mod tests {
         let kraken = "C\tr2\t2\t100\t2:5\nC\tr1\t1\t100\t1:5\n";
         let mut s = streaming(kraken);
         assert_eq!(s.lookup("r1").unwrap(), Some(1));
-        assert_eq!(s.count_unconsumed(), 1, "r2 should still be in buffer");
+        assert_eq!(
+            s.count_unconsumed().unwrap(),
+            1,
+            "r2 should still be in buffer"
+        );
+    }
+
+    #[test]
+    fn test_streaming_lookup_count_unconsumed_propagates_parse_error() {
+        // A malformed line in the unconsumed tail must surface as an error, not
+        // be silently swallowed (which would also undercount the leftovers).
+        let kraken = "C\tr1\t1\t100\t1:5\nTHIS_LINE_IS_NOT_VALID\n";
+        let mut s = streaming(kraken);
+        assert_eq!(s.lookup("r1").unwrap(), Some(1));
+        assert!(
+            s.count_unconsumed().is_err(),
+            "a malformed tail line must propagate as an error"
+        );
     }
 
     #[test]
@@ -518,6 +536,6 @@ mod tests {
         let mut s = streaming(kraken);
         assert_eq!(s.lookup("r1").unwrap(), Some(1));
         assert_eq!(s.lookup("missing").unwrap(), None);
-        assert_eq!(s.count_unconsumed(), 0);
+        assert_eq!(s.count_unconsumed().unwrap(), 0);
     }
 }

@@ -149,6 +149,19 @@ fn test_no_subcommand_fails() {
 }
 
 #[test]
+fn test_n2ref_rejects_qual_above_max_phred() {
+    // --qual is a Phred quality and must be within 0..=93 (the SAM/BAM ceiling).
+    // A value above 93 must be rejected at parse time (clap usage error, exit
+    // code 2), not accepted and later rejected mid-stream by the record writer
+    // (which would leave a truncated output file).
+    krak()
+        .args(["n2ref", "--qual", "94", "-r", "/nonexistent/ref.fa", "-"])
+        .assert()
+        .failure()
+        .code(2);
+}
+
+#[test]
 fn test_prep_help() {
     krak().args(["prep", "--help"]).assert().success();
 }

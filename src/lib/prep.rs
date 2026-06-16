@@ -1261,20 +1261,26 @@ pub(crate) fn write_fasta(
     templates: impl Iterator<Item = anyhow::Result<Template>>,
     mut out: impl Write,
 ) -> Result<()> {
-    for result in templates {
-        let mut tmpl = result?;
-        writeln!(out, ">{}", tmpl.name).context("failed to write FASTA header")?;
-        tmpl.r1.make_ascii_uppercase();
-        out.write_all(&tmpl.r1)
-            .context("failed to write sequence")?;
-        if let Some(ref mut r2) = tmpl.r2 {
-            r2.make_ascii_uppercase();
-            out.write_all(b"N").context("failed to write N separator")?;
-            out.write_all(r2).context("failed to write mate sequence")?;
+    // Flush unconditionally, even when a template errors mid-stream, so a
+    // partial output is finalized and a flush error is surfaced rather than
+    // swallowed by `BufWriter`'s drop.
+    let body: Result<()> = (|| {
+        for result in templates {
+            let mut tmpl = result?;
+            writeln!(out, ">{}", tmpl.name).context("failed to write FASTA header")?;
+            tmpl.r1.make_ascii_uppercase();
+            out.write_all(&tmpl.r1)
+                .context("failed to write sequence")?;
+            if let Some(ref mut r2) = tmpl.r2 {
+                r2.make_ascii_uppercase();
+                out.write_all(b"N").context("failed to write N separator")?;
+                out.write_all(r2).context("failed to write mate sequence")?;
+            }
+            writeln!(out).context("failed to write record newline")?;
         }
-        writeln!(out).context("failed to write record newline")?;
-    }
-    out.flush().context("failed to flush output")
+        Ok(())
+    })();
+    crate::finish_after(body, || out.flush().context("failed to flush output"))
 }
 
 #[cfg(test)]

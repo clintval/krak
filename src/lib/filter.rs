@@ -536,9 +536,9 @@ impl<'a> LookupState<'a> {
     /// record. The map-based source has no notion of unconsumed entries, so it
     /// returns 0; the stream-based source counts buffered entries plus the
     /// remaining stream tail.
-    fn count_unconsumed(&mut self) -> usize {
+    fn count_unconsumed(&mut self) -> Result<usize> {
         match self {
-            Self::Map(_) => 0,
+            Self::Map(_) => Ok(0),
             Self::Stream(s) => s.count_unconsumed(),
         }
     }
@@ -798,7 +798,7 @@ fn filter_fastq_from_reader(
             .finalize()
             .context("failed to finalize reject FASTQ output")?;
     }
-    let leftover = lookup.count_unconsumed();
+    let leftover = lookup.count_unconsumed()?;
     if leftover > 0 {
         warn!(
             "{leftover} Kraken assignments remained after the input ran out; \
@@ -997,7 +997,7 @@ fn filter_paired_fastq(args: &FilterArgs) -> Result<TaxaFilterMetric> {
             .finalize()
             .context("failed to finalize R2 reject FASTQ output")?;
     }
-    let leftover = lookup.count_unconsumed();
+    let leftover = lookup.count_unconsumed()?;
     if leftover > 0 {
         warn!(
             "{leftover} Kraken assignments remained after the input ran out; \
@@ -1090,7 +1090,7 @@ fn filter_fasta_from_reader(
             .finalize()
             .context("failed to finalize reject FASTA output")?;
     }
-    let leftover = lookup.count_unconsumed();
+    let leftover = lookup.count_unconsumed()?;
     if leftover > 0 {
         warn!(
             "{leftover} Kraken assignments remained after the input ran out; \
@@ -1137,7 +1137,10 @@ fn filter_bam_with_reader<R: std::io::Read>(
         })
         .transpose()?;
 
-    let metrics = dispatch_filter_records(
+    // Finalize the writers unconditionally, even if the loop errored, so a
+    // partial BAM still gets its BGZF EOF block (and a finish error surfaces)
+    // rather than being left truncated. The loop's error takes precedence.
+    let body = dispatch_filter_records(
         args,
         &params,
         &header,
@@ -1145,17 +1148,19 @@ fn filter_bam_with_reader<R: std::io::Read>(
         &mut writer,
         &mut reject_writer,
         "samtools sort -n input.bam",
-    )?;
-
-    writer
-        .into_inner()
-        .finish()
-        .context("failed to finish BAM BGZF stream")?;
-    if let Some(rw) = reject_writer {
-        rw.into_inner()
+    );
+    let metrics = crate::finish_after(body, || {
+        writer
+            .into_inner()
             .finish()
-            .context("failed to finish rejects BAM BGZF stream")?;
-    }
+            .context("failed to finish BAM BGZF stream")?;
+        if let Some(rw) = reject_writer {
+            rw.into_inner()
+                .finish()
+                .context("failed to finish rejects BAM BGZF stream")?;
+        }
+        Ok(())
+    })?;
     crate::maybe_index_alignment_output(&args.output, &header, AlignmentFormat::Bam)?;
     if let Some(rejects_path) = args.rejects.as_deref() {
         crate::maybe_index_alignment_output(rejects_path, &header, AlignmentFormat::Bam)?;
@@ -1203,7 +1208,10 @@ fn filter_sam_with_reader<R: std::io::BufRead>(
         })
         .transpose()?;
 
-    let metrics = dispatch_filter_records(
+    // Finalize the writers unconditionally, even if the loop errored, so a
+    // partial SAM is flushed (and a flush error surfaces) rather than being
+    // left in the unflushed buffer. The loop's error takes precedence.
+    let body = dispatch_filter_records(
         args,
         &params,
         &header,
@@ -1211,17 +1219,19 @@ fn filter_sam_with_reader<R: std::io::BufRead>(
         &mut writer,
         &mut reject_writer,
         "samtools sort -n input.sam",
-    )?;
-
-    writer
-        .into_inner()
-        .flush()
-        .context("failed to flush SAM writer")?;
-    if let Some(rw) = reject_writer {
-        rw.into_inner()
+    );
+    let metrics = crate::finish_after(body, || {
+        writer
+            .into_inner()
             .flush()
-            .context("failed to flush rejects SAM writer")?;
-    }
+            .context("failed to flush SAM writer")?;
+        if let Some(rw) = reject_writer {
+            rw.into_inner()
+                .flush()
+                .context("failed to flush rejects SAM writer")?;
+        }
+        Ok(())
+    })?;
     Ok(metrics)
 }
 
@@ -1256,7 +1266,10 @@ fn filter_cram_with_reader<R: std::io::Read>(
         })
         .transpose()?;
 
-    let result = dispatch_filter_records(
+    // Finish the writers unconditionally (this path always did), but route it
+    // through `finish_after` so the loop's error takes precedence over a
+    // finalize error, consistent with the BAM/SAM paths.
+    let body = dispatch_filter_records(
         args,
         &params,
         &header,
@@ -1265,19 +1278,21 @@ fn filter_cram_with_reader<R: std::io::Read>(
         &mut reject_writer,
         "samtools sort -n -T ref.fa input.cram",
     );
-
-    writer
-        .try_finish(&header)
-        .context("failed to finish CRAM writer")?;
-    if let Some(rw) = reject_writer.as_mut() {
-        rw.try_finish(&header)
-            .context("failed to finish CRAM rejects writer")?;
-    }
+    let metrics = crate::finish_after(body, || {
+        writer
+            .try_finish(&header)
+            .context("failed to finish CRAM writer")?;
+        if let Some(rw) = reject_writer.as_mut() {
+            rw.try_finish(&header)
+                .context("failed to finish CRAM rejects writer")?;
+        }
+        Ok(())
+    })?;
     crate::maybe_index_alignment_output(&args.output, &header, AlignmentFormat::Cram)?;
     if let Some(rejects_path) = args.rejects.as_deref() {
         crate::maybe_index_alignment_output(rejects_path, &header, AlignmentFormat::Cram)?;
     }
-    result
+    Ok(metrics)
 }
 
 fn make_params<'a>(
