@@ -375,8 +375,11 @@ where
     I: Iterator<Item = std::io::Result<noodles::sam::alignment::record_buf::RecordBuf>>,
     F: FnOnce(W, &noodles::sam::Header) -> Result<()>,
 {
-    let (annotated, total, missing) = annotate_records(records, &mut writer, header, source, fmt)?;
-    finalize(writer, header)?;
+    // Finalize the writer unconditionally, even if the record loop errored: a
+    // threaded BGZF (BAM) writer dropped without an explicit finish panics in
+    // gzp's Drop, masking the real error. `finish_after` keeps the loop error.
+    let body = annotate_records(records, &mut writer, header, source, fmt);
+    let (annotated, total, missing) = crate::finish_after(body, || finalize(writer, header))?;
     info!("Annotated {annotated} / {total} records ({missing} records had no name).");
     if let Some(fmt) = output_format {
         crate::maybe_index_alignment_output(output, header, fmt)?;
@@ -411,11 +414,24 @@ where
 
         if let Some(name_bytes) = record.name() {
             let name = std::str::from_utf8(name_bytes).context("non-UTF-8 read name")?;
-            match lookup(name)? {
+            // Kraken strips trailing `/1`/`/2` from query names; strip the SAM
+            // QNAME the same way before lookup so suffixed names still match
+            // (mirrors `filter`). The record itself is written unchanged.
+            let lookup_name = crate::strip_pair_suffix(name);
+            match lookup(lookup_name)? {
                 Some(taxon_id) => {
+                    // The SAM `ti:i:` aux type is a signed 32-bit integer.
+                    // Reject taxon IDs above i32::MAX rather than truncating
+                    // them into a negative tag value.
+                    let ti = i32::try_from(taxon_id).with_context(|| {
+                        format!(
+                            "taxon ID {taxon_id} for read {name:?} exceeds the SAM ti tag's \
+                             signed 32-bit range"
+                        )
+                    })?;
                     record
                         .data_mut()
-                        .insert(crate::TI_TAG.into(), Value::Int32(taxon_id as i32));
+                        .insert(crate::TI_TAG.into(), Value::Int32(ti));
                     annotated += 1;
                 }
                 None => {
@@ -447,6 +463,125 @@ mod tests {
         let mut r = RecordBuf::default();
         *r.name_mut() = Some(name.as_bytes().into());
         r
+    }
+
+    #[test]
+    fn test_run_annotate_pipeline_finalizes_writer_even_on_record_error() {
+        use noodles::sam;
+        use std::cell::Cell;
+
+        let header = sam::Header::default();
+        let writer = sam::io::Writer::new(Vec::new());
+        let finalized = Cell::new(false);
+        let empty: AHashMap<String, u32> = AHashMap::new();
+        // A record stream that errors on its first item.
+        let records = std::iter::once::<std::io::Result<RecordBuf>>(Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "boom",
+        )));
+
+        let result = run_annotate_pipeline(
+            writer,
+            &header,
+            records,
+            Source::Map(&empty),
+            "SAM",
+            std::path::Path::new("/dev/stdout"),
+            None,
+            |w, _| {
+                finalized.set(true);
+                w.into_inner().flush().context("flush")?;
+                Ok(())
+            },
+        );
+
+        assert!(result.is_err(), "the record-loop error must propagate");
+        assert!(
+            finalized.get(),
+            "writer must be finalized even when the record loop errors (else a \
+             threaded BGZF writer is dropped un-finished and panics in gzp's Drop)"
+        );
+    }
+
+    #[test]
+    fn test_annotate_strips_pair_suffix_from_sam_qname() {
+        use std::io::Write as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let in_sam = dir.path().join("in.sam");
+        // QNAME literally carries a Kraken v1 `/1` suffix.
+        std::fs::write(
+            &in_sam,
+            b"@HD\tVN:1.6\nread1/1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n",
+        )
+        .unwrap();
+
+        let assignments = dir.path().join("assignments.txt");
+        {
+            let mut f = std::fs::File::create(&assignments).unwrap();
+            // Kraken stores the base name (the `/1` suffix is stripped on parse).
+            writeln!(f, "C\tread1\t9606\t4\t9606:1").unwrap();
+        }
+
+        let out_sam = dir.path().join("out.sam");
+        super::run_annotate(super::AnnotateArgs {
+            input: in_sam,
+            assignments,
+            output: out_sam.clone(),
+            kraken_report: None,
+            kraken_db: None,
+            unordered: false,
+            cram_reference: None,
+            threads: 1,
+            compression_level: 5,
+        })
+        .unwrap();
+
+        // The record must be annotated, not fatally rejected as "not present".
+        let text = std::fs::read_to_string(&out_sam).unwrap();
+        assert!(
+            text.contains("ti:i:9606"),
+            "expected ti:i:9606 in output, got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn test_annotate_errors_on_taxon_id_exceeding_i32() {
+        use std::io::Write as _;
+
+        let dir = tempfile::TempDir::new().unwrap();
+        let in_sam = dir.path().join("in.sam");
+        std::fs::write(
+            &in_sam,
+            b"@HD\tVN:1.6\nread1\t4\t*\t0\t0\t*\t*\t0\t0\tACGT\tIIII\n",
+        )
+        .unwrap();
+
+        let assignments = dir.path().join("assignments.txt");
+        {
+            let mut f = std::fs::File::create(&assignments).unwrap();
+            // 3_000_000_000 fits in u32 but exceeds i32::MAX (2_147_483_647);
+            // it must not be truncated into a negative `ti` tag.
+            writeln!(f, "C\tread1\t3000000000\t4\t3000000000:1").unwrap();
+        }
+
+        let result = super::run_annotate(super::AnnotateArgs {
+            input: in_sam,
+            assignments,
+            output: dir.path().join("out.sam"),
+            kraken_report: None,
+            kraken_db: None,
+            unordered: true,
+            cram_reference: None,
+            threads: 1,
+            compression_level: 5,
+        });
+
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("taxon"),
+            "expected a taxon-range error, got: {err:#}"
+        );
     }
 
     #[test]

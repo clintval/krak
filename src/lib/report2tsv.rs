@@ -84,7 +84,12 @@ pub fn run_report2tsv(args: Report2TsvArgs) -> Result<()> {
         .context("failed to write TSV header")?;
 
     for (entry, (parent_tax_id, parent_rank)) in entries.iter().zip(parents.iter()) {
-        let descendant_count = entry.num_fragments_clade - entry.num_fragments_direct;
+        // `clade >= direct` holds for well-formed kraken2 reports, but this
+        // command consumes arbitrary user files; saturate rather than panic
+        // (debug) or wrap to a garbage value (release) on a malformed row.
+        let descendant_count = entry
+            .num_fragments_clade
+            .saturating_sub(entry.num_fragments_direct);
         let (frac_clade, frac_direct, frac_descendant) = if total > 0 {
             let t = total as f64;
             (
@@ -332,5 +337,18 @@ mod tests {
         let rows = run_report("");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0], "tax_id");
+    }
+
+    #[test]
+    fn test_descendant_count_does_not_underflow_when_direct_exceeds_clade() {
+        // A malformed report row with direct > clade must not panic (debug) or
+        // wrap to a near-u64::MAX garbage value (release). descendant_count
+        // saturates to 0 and the run completes.
+        let report = "100.00\t1\t5\tR\t1\troot\n";
+        let rows = run_report(report);
+        assert_eq!(
+            rows[1][8], "0",
+            "descendant_count must saturate to 0 when direct exceeds clade"
+        );
     }
 }

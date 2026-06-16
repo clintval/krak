@@ -345,7 +345,7 @@ struct N2RefCmd {
     reference: PathBuf,
 
     /// Replacement base quality score for converted N-calls (0–93). Defaults to original quality.
-    #[arg(short = 'q', long)]
+    #[arg(short = 'q', long, value_parser = clap::value_parser!(u8).range(0..=93))]
     qual: Option<u8>,
 
     /// Number of bgzf compression worker threads for BAM output. At 1

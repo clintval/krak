@@ -168,6 +168,32 @@ pub fn read_taxo_k2d(path: &Path) -> Result<Vec<KrakenReportEntry>> {
     let name_data_len = read_u64_le(&mut handle).context("failed to read name_data_len")? as usize;
     let rank_data_len = read_u64_le(&mut handle).context("failed to read rank_data_len")? as usize;
 
+    // Reject declared sizes that cannot fit in the file before allocating, so a
+    // corrupt/hostile header can't trigger a giant allocation that aborts the
+    // process instead of producing a clean error. The `read_exact` calls below
+    // re-validate the exact byte counts.
+    let file_len = handle
+        .metadata()
+        .with_context(|| format!("failed to stat {}", path.display()))?
+        .len();
+    const HEADER_LEN: u64 = 8 + 8 * 3; // magic + node_count + name/rank lengths
+    let body_len = file_len.saturating_sub(HEADER_LEN);
+    let max_nodes = body_len / NODE_BYTE_LEN as u64;
+    if node_count as u64 > max_nodes {
+        bail!(
+            "{}: taxo.k2d declares node_count={node_count} but the file holds room for at \
+             most {max_nodes} nodes; file is truncated or corrupt",
+            path.display()
+        );
+    }
+    if name_data_len as u64 > body_len || rank_data_len as u64 > body_len {
+        bail!(
+            "{}: taxo.k2d declares name_data_len={name_data_len}/rank_data_len={rank_data_len} \
+             exceeding the {body_len}-byte body; file is truncated or corrupt",
+            path.display()
+        );
+    }
+
     let mut nodes = Vec::with_capacity(node_count);
     for i in 0..node_count {
         let mut buf = [0u8; NODE_BYTE_LEN];
@@ -239,7 +265,12 @@ pub fn read_taxo_k2d(path: &Path) -> Result<Vec<KrakenReportEntry>> {
             num_fragments_clade: 0,
             num_fragments_direct: 0,
             rank_code: rank_code(cstr_at(&rank_data, node.rank_offset as usize)?).to_owned(),
-            taxon_id: node.external_id as u32,
+            taxon_id: u32::try_from(node.external_id).map_err(|_| {
+                anyhow::anyhow!(
+                    "taxo.k2d node {idx}: external_id {} exceeds u32 range",
+                    node.external_id
+                )
+            })?,
             name: cstr_at(&name_data, node.name_offset as usize)?.to_owned(),
             indent: depth * SPACES_PER_DEPTH,
             minimizer_count: None,
@@ -458,6 +489,58 @@ mod tests {
         let tmp = write_tmp(&buf);
         let err = read_taxo_k2d(tmp.path()).unwrap_err();
         assert!(format!("{err:#}").contains("expected at least"));
+    }
+
+    #[test]
+    fn test_taxo_k2d_implausible_node_count_errors_cleanly() {
+        // A corrupt/hostile header declaring an enormous node_count must
+        // produce a clean error rather than abort the process inside a giant
+        // `Vec::with_capacity`.
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&u64::MAX.to_le_bytes()); // node_count = u64::MAX
+        buf.extend_from_slice(&0u64.to_le_bytes()); // name_data_len
+        buf.extend_from_slice(&0u64.to_le_bytes()); // rank_data_len
+        let tmp = write_tmp(&buf);
+        let err = read_taxo_k2d(tmp.path()).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("node_count") || msg.contains("truncated") || msg.contains("corrupt"),
+            "expected a size-sanity error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn test_taxo_k2d_external_id_exceeding_u32_errors() {
+        // An external_id above u32::MAX must error, not silently truncate to a
+        // wrong (or zero) taxon id.
+        let name_data: &[u8] = b"root\0";
+        let rank_data: &[u8] = b"no rank\0";
+        let big: u64 = u32::MAX as u64 + 1; // 4_294_967_296
+        let node_specs: &[(u64, u64, u64, u64, u64, u64, u64)] = &[
+            (0, 0, 0, 0, 0, 0, 0),   // placeholder
+            (0, 0, 0, 0, 0, big, 0), // root with out-of-range external_id
+        ];
+
+        let mut buf: Vec<u8> = Vec::new();
+        buf.extend_from_slice(MAGIC);
+        buf.extend_from_slice(&(node_specs.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(name_data.len() as u64).to_le_bytes());
+        buf.extend_from_slice(&(rank_data.len() as u64).to_le_bytes());
+        for &(p, fc, cc, no, ro, ei, gp) in node_specs {
+            for v in [p, fc, cc, no, ro, ei, gp] {
+                buf.extend_from_slice(&v.to_le_bytes());
+            }
+        }
+        buf.extend_from_slice(name_data);
+        buf.extend_from_slice(rank_data);
+
+        let tmp = write_tmp(&buf);
+        let err = read_taxo_k2d(tmp.path()).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("external_id"),
+            "expected an external_id range error, got: {err:#}"
+        );
     }
 
     #[test]

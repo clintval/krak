@@ -350,6 +350,25 @@ pub fn open_fastx_writer(path: &std::path::Path) -> std::io::Result<Box<dyn std:
     }
 }
 
+/// Run `finalize` after `body`, **unconditionally**: even when `body` errored.
+///
+/// A threaded BGZF writer (`gzp::ParCompress`, used for BAM output) calls
+/// `finish().unwrap()` in its `Drop` impl when it is dropped without an explicit
+/// `finish()`. On an error path that would turn the real, useful error into an
+/// opaque panic (and, mid-unwind, an abort). Routing both the success and error
+/// paths through here guarantees the writer is always finished explicitly, so
+/// its `Drop` is a no-op. The body's error takes precedence over a finalize
+/// error, since it is the more useful root cause.
+pub(crate) fn finish_after<T>(
+    body: anyhow::Result<T>,
+    finalize: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<T> {
+    let finalize_result = finalize();
+    let value = body?;
+    finalize_result?;
+    Ok(value)
+}
+
 /// Alignment file format inferred from file extension.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AlignmentFormat {
@@ -972,6 +991,41 @@ mod tests {
             "/tmp/output.bam"
         )));
         assert!(!super::is_pseudo_path(std::path::Path::new("output.bam")));
+    }
+
+    #[test]
+    fn test_finish_after_runs_finalize_even_when_body_errors() {
+        use std::cell::Cell;
+        let finalized = Cell::new(false);
+        let body: anyhow::Result<u8> = Err(anyhow::anyhow!("body boom"));
+        let result = super::finish_after(body, || {
+            finalized.set(true);
+            Ok(())
+        });
+        assert!(
+            finalized.get(),
+            "finalize must run even when the body errored (else a threaded BGZF \
+             writer would be dropped un-finished and panic in gzp's Drop)"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            format!("{err:#}").contains("body boom"),
+            "the body error must take precedence over a finalize error"
+        );
+    }
+
+    #[test]
+    fn test_finish_after_propagates_finalize_error_on_body_success() {
+        let body: anyhow::Result<u8> = Ok(7);
+        let result = super::finish_after(body, || Err(anyhow::anyhow!("finalize boom")));
+        let err = result.unwrap_err();
+        assert!(format!("{err:#}").contains("finalize boom"));
+    }
+
+    #[test]
+    fn test_finish_after_returns_value_on_full_success() {
+        let body: anyhow::Result<u8> = Ok(7);
+        assert_eq!(super::finish_after(body, || Ok(())).unwrap(), 7);
     }
 
     #[test]
