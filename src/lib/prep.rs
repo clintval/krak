@@ -766,7 +766,7 @@ where
 
         // Assign start record to r1 or r2
         let flags = start.flags();
-        // TODO(D1): borrowed-Vec refactor; these per-record allocations could
+        // TODO: borrowed-Vec refactor; these per-record allocations could
         // share a reusable scratch buffer threaded through the iterator, at
         // the cost of an extra borrow lifetime in the public signature.
         let mut seq = start.sequence().as_ref().to_vec();

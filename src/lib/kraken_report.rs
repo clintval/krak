@@ -602,7 +602,7 @@ mod tests {
     fn test_from_line_tab_in_indent_errors() {
         // A leading tab inside the name field is not an ASCII space, so the
         // indent count is 0; but the field also embeds another tab, which
-        // produces 7 fields (still parseable). The real B15 case: a line
+        // produces 7 fields (still parseable). The real case: a line
         // whose name field starts with an odd number of leading spaces is
         // not a valid Kraken indent and must error.
         let line = "100.00\t2000\t0\tR\t1\t Bacteria";

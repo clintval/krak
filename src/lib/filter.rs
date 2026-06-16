@@ -2363,7 +2363,7 @@ mod tests {
 
     #[test]
     fn test_classify_template_ignores_supplementary_taxon_for_on_taxa() {
-        // B3: a template whose primary record is off-taxa but whose
+        // A template whose primary record is off-taxa but whose
         // supplementary alignment carries an on-taxa ti tag must NOT be
         // classified as OnTaxa; supplementary/secondary taxon IDs are
         // ignored for classification, consistent with the edit-rescue path.
@@ -2418,7 +2418,7 @@ mod tests {
 
     #[test]
     fn test_within_edit_limits_no_rescue_requested_returns_false_even_for_zero_edits() {
-        // B4: with default --max-edit-distance 0 and no other rescue knobs set,
+        // With default --max-edit-distance 0 and no other rescue knobs set,
         // edit rescue must be disabled entirely. A record with 0 edits must
         // NOT be rescued just because it satisfies the trivially-zero default.
         let record =

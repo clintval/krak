@@ -1068,7 +1068,7 @@ mod tests {
         );
     }
 
-    /// B9: when path-based detection says BAM only because the input path is a
+    /// When path-based detection says BAM only because the input path is a
     /// pseudo-path (here a symlink under `/dev/fd/` is awkward to construct in
     /// a unit test, so we directly verify the `from_path` heuristic plus the
     /// sniff fallback by symlinking via /dev/fd is platform-specific).
@@ -1083,7 +1083,7 @@ mod tests {
         // Write a SAM stream to a file with no recognized extension.
         // AlignmentFormat::from_path falls back to Sam for unknown
         // extensions, NOT Bam; pseudo-paths are the only ones forcing Bam.
-        // To exercise the B9 code path proper, use a path that mimics a
+        // To exercise this code path proper, use a path that mimics a
         // pseudo-path tail so detection picks Bam, then sniff overrides to Sam.
         let sam_path = dir.path().join("stream.sam");
         {
@@ -1331,7 +1331,7 @@ mod tests {
         assert!(format!("{err:#}").contains("not present in the assignments"));
     }
 
-    /// B9 (pseudo-path branch): construct a `/dev/fd/N` reference to a real
+    /// Pseudo-path branch: construct a `/dev/fd/N` reference to a real
     /// SAM file and verify that `run_annotate` routes through the SAM handler
     /// rather than failing in the BAM reader. Requires Unix `/dev/fd/`.
     #[cfg(unix)]
