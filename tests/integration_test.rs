@@ -1960,7 +1960,7 @@ fn write_coord_sorted_bam(path: &Path, ti_tag: Option<u32>) {
     *r.sequence_mut() = Sequence::from(b"ACGT".to_vec());
     *r.quality_scores_mut() = QualityScores::from(vec![30u8; 4]);
     if let Some(ti) = ti_tag {
-        r.data_mut().insert([b't', b'i'].into(), Value::UInt32(ti));
+        r.data_mut().insert((*b"ti").into(), Value::UInt32(ti));
     }
     w.write_alignment_record(&header, &r).unwrap();
 }
@@ -2062,7 +2062,7 @@ fn filter_coord_sorted_bam_writes_bai_for_output_and_rejects() {
                 Some(noodles::core::Position::try_from(pos as usize).unwrap());
             *r.sequence_mut() = Sequence::from(b"ACGT".to_vec());
             *r.quality_scores_mut() = QualityScores::from(vec![30u8; 4]);
-            r.data_mut().insert([b't', b'i'].into(), Value::UInt32(ti));
+            r.data_mut().insert((*b"ti").into(), Value::UInt32(ti));
             w.write_alignment_record(&header, &r).unwrap();
         }
     }

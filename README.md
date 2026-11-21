@@ -1,4 +1,6 @@
-# krak
+![Banner for krak](https://raw.githubusercontent.com/clintval/krak/main/.github/img/krak_banner.svg)
+
+---
 
 [![Install with bioconda](https://img.shields.io/badge/Install%20with-bioconda-brightgreen.svg)](http://bioconda.github.io/recipes/krak/README.html)
 [![Anaconda Version](https://anaconda.org/bioconda/krak/badges/version.svg)](http://bioconda.github.io/recipes/krak/README.html)
@@ -7,8 +9,6 @@
 [![Language](https://img.shields.io/badge/language-rust-dea588.svg)](https://www.rust-lang.org/)
 
 An addicting set of Kraken-enhancing tools.
-
-![Monkey Pod Tree](.github/img/cover.jpg)
 
 Install with mamba, conda, or run directly with pixi:
 

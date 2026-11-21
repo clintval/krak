@@ -124,7 +124,7 @@ pub struct FilterArgs {
 }
 
 /// MD tag.
-const MD_TAG: [u8; 2] = [b'M', b'D'];
+const MD_TAG: [u8; 2] = *b"MD";
 
 /// Counts of edits from reference for a single record.
 #[derive(Debug, Default)]
