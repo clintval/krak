@@ -18,7 +18,7 @@ pub use prep::{run_prep, PrepArgs};
 pub use report2tsv::{run_report2tsv, Report2TsvArgs};
 
 /// SAM auxiliary tag for the Kraken taxonomic ID: `ti`.
-pub(crate) const TI_TAG: [u8; 2] = [b't', b'i'];
+pub(crate) const TI_TAG: [u8; 2] = *b"ti";
 
 /// Return `true` if the SAM/BAM/CRAM header indicates query-grouped ordering
 /// (`SO:queryname` or `GO:query` in the `@HD` line).
